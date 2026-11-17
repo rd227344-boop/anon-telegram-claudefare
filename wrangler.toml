@@ -1,0 +1,22 @@
+name = "anon-telegram-claudefare"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nexus-db"
+database_id = "YAHAN_APNI_D1_ID"
+
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+ADMIN_IDS = "123456789"
+GAP_MIN_SECONDS = "10"
+GAP_MAX_SECONDS = "15"
+BROADCAST_CHUNK = "30"
+AUTO_BAN_REPORTS = "5"
+
+[observability]
+enabled = true
