@@ -5,9 +5,12 @@ workers_dev = true
 
 [[d1_databases]]
 binding = "DB"
-database_name = "nexus-db"
-database_id = "YAHAN_APNI_D1_ID"
-
+database_name = """d1_databases": [{
+    "binding": "DB",
+    "database_name": "nexus-db",
+    "database_id": "e5939fa4-9024-411d-b513-099e0cccc433"
+ }]
+database_id = "8858934619"
 [triggers]
 crons = ["* * * * *"]
 
