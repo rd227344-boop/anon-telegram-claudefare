@@ -5,17 +5,14 @@ workers_dev = true
 
 [[d1_databases]]
 binding = "DB"
-database_name = """d1_databases": [{
-    "binding": "DB",
-    "database_name": "nexus-db",
-    "database_id": "e5939fa4-9024-411d-b513-099e0cccc433"
- }]
-database_id = "8858934619"
+database_name = "nexus-db"
+database_id = "e5939fa4-9024-411d-b513-099e0cccc433"
+
 [triggers]
 crons = ["* * * * *"]
 
 [vars]
-ADMIN_IDS = "123456789"
+ADMIN_IDS = "8858934619"
 GAP_MIN_SECONDS = "10"
 GAP_MAX_SECONDS = "15"
 BROADCAST_CHUNK = "30"
