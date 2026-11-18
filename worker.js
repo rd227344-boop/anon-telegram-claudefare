@@ -16,6 +16,7 @@ const DEFAULTS = {
   WARN_AFTER_REPORTS: 3, // itne alag users ki report ke baad har nayi report par warning
   MIN_REPORT_TEXT: 25, // underage report / appeal mein kam se kam itne characters
 };
+const MAX_SAVED = 10; // ek user ke max saved partners
 const cfg = (env, key) => {
   const v = Number(env[key]);
   return Number.isFinite(v) && v > 0 ? v : DEFAULTS[key];
@@ -37,15 +38,19 @@ const CAT_NAME = { photo: "photo", sticker: "sticker", video: "video", file: "fi
 const CAT_PLURAL = { photo: "photos", sticker: "stickers", video: "videos", file: "files and voice messages" };
 
 // Typed hone ki sambhavna kam rakhne ke liye lambe labels
-const BTN_NEXT = "Next Partner";
-const BTN_STOP = "Stop Chat";
-const BTN_SAVE = "Save Partner";
-const BTN_SAVED = "Saved Partners";
-const BUTTONS = [BTN_NEXT, BTN_STOP, BTN_SAVE, BTN_SAVED];
+const BTN_NEXT = "⏭ Next Partner";
+const BTN_STOP = "⛔ Stop Chat";
+const BTN_SAVE = "💾 Save Partner";
+const BTN_SAVED = "📂 Saved Partners";
+const BTN_PLAY = "🎮 Play Game";
+const BUTTONS = [BTN_NEXT, BTN_STOP, BTN_SAVE, BTN_SAVED, BTN_PLAY];
+// purane keyboard wale users abhi purane labels bhejenge, unhe naye button maano
+const LEGACY_BTN = { "Next Partner": BTN_NEXT, "Stop Chat": BTN_STOP, "Save Partner": BTN_SAVE, "Saved Partners": BTN_SAVED };
 
 const MAIN_KEYBOARD = {
-  keyboard: [[{ text: BTN_NEXT }, { text: BTN_STOP }], [{ text: BTN_SAVE }, { text: BTN_SAVED }]],
+  keyboard: [[{ text: BTN_NEXT }, { text: BTN_STOP }], [{ text: BTN_SAVE }, { text: BTN_SAVED }], [{ text: BTN_PLAY }]],
   resize_keyboard: true,
+  is_persistent: true, // keyboard (Next / Stop...) hamesha dikhta rahe, chhupta nahi
 };
 
 const MATCH_MSG = "**Connected with a stranger.** Say hello!\nUse the buttons below to control the chat.";
@@ -100,6 +105,21 @@ const SCHEMA = [
     cursor INTEGER DEFAULT 0, lock_until INTEGER, created_at INTEGER, finished_at INTEGER
   )`,
   `CREATE TABLE IF NOT EXISTS user_state (user_id INTEGER PRIMARY KEY, kind TEXT, data TEXT, ts INTEGER)`,
+  `CREATE TABLE IF NOT EXISTS ratings (rater_id INTEGER, rated_id INTEGER, v INTEGER, day TEXT, PRIMARY KEY (rater_id, rated_id, day))`,
+  `CREATE TABLE IF NOT EXISTS blocks (user_id INTEGER, blocked_id INTEGER, PRIMARY KEY (user_id, blocked_id))`,
+  `CREATE TABLE IF NOT EXISTS saved_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, from_id INTEGER, to_id INTEGER, kind TEXT, ts INTEGER, status TEXT
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_sr_to ON saved_requests (to_id, status)`,
+  `CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, text TEXT, ts INTEGER)`,
+  `CREATE TABLE IF NOT EXISTS games (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, p1 INTEGER, p2 INTEGER, board TEXT, xid INTEGER, turn INTEGER, status TEXT,
+    m1 INTEGER, m2 INTEGER, last_act INTEGER, turn_ts INTEGER, miss1 INTEGER DEFAULT 0, miss2 INTEGER DEFAULT 0
+  )`,
+  `CREATE TABLE IF NOT EXISTS link_state (
+    user_id INTEGER PRIMARY KEY, verified INTEGER DEFAULT 0, links_left INTEGER DEFAULT 0, tries INTEGER DEFAULT 0,
+    sent INTEGER DEFAULT 0, flagged INTEGER DEFAULT 0, pending TEXT, target TEXT
+  )`,
   `CREATE TABLE IF NOT EXISTS appeals (
     id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, text TEXT, ts INTEGER, status TEXT
   )`,
@@ -119,6 +139,8 @@ async function ensureSchema(env) {
   await addMissing("users", {
     created_at: "INTEGER", last_seen: "INTEGER", banned: "INTEGER DEFAULT 0", ban_reason: "TEXT",
     ban_until: "INTEGER", ban_count: "INTEGER DEFAULT 0", appeal_state: "INTEGER DEFAULT 0", report_floor: "INTEGER DEFAULT 0",
+    likes: "INTEGER DEFAULT 0", dislikes: "INTEGER DEFAULT 0", badge_penalty: "INTEGER DEFAULT 0", streak: "INTEGER DEFAULT 0",
+    last_active_day: "TEXT", restrict_until: "INTEGER DEFAULT 0", spam_chats: "INTEGER DEFAULT 0", spam_offenses: "INTEGER DEFAULT 0",
   });
   await addMissing("reports", { details: "TEXT", shot: "TEXT" });
   await addMissing("recent", { gap: "INTEGER DEFAULT 15" });
@@ -219,7 +241,7 @@ async function sendMedia(env, chatId, kind, fileId) {
 
 async function getProfile(env, id) {
   return await env.DB.prepare(
-    "SELECT gender, age, language, waiting_nick, banned, ban_reason, ban_until, ban_count, appeal_state, report_floor, last_seen FROM users WHERE user_id = ?"
+    "SELECT gender, age, language, waiting_nick, banned, ban_reason, ban_until, ban_count, appeal_state, report_floor, last_seen, likes, dislikes, badge_penalty, streak, last_active_day, restrict_until, spam_chats, spam_offenses FROM users WHERE user_id = ?"
   ).bind(id).first();
 }
 
@@ -288,6 +310,8 @@ async function setConsent(env, sender, receiver, cat, state) {
 
 // Chat khatam: chat rows hatao, gap lagao, media permissions reset karo
 async function endChat(env, a, b) {
+  await finalizeLinks(env, a);
+  await finalizeLinks(env, b);
   const t = nowSec();
   const min = cfg(env, "GAP_MIN_SECONDS");
   const max = Math.max(min, cfg(env, "GAP_MAX_SECONDS"));
@@ -298,25 +322,378 @@ async function endChat(env, a, b) {
     env.DB.prepare("INSERT OR REPLACE INTO recent (user_id, partner_id, ts, gap) VALUES (?, ?, ?, ?)").bind(b, a, t, gap),
     env.DB.prepare("DELETE FROM media_consent WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)").bind(a, b, b, a),
     env.DB.prepare("DELETE FROM media_pending WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)").bind(a, b, b, a),
+    env.DB.prepare("UPDATE games SET status = 'done' WHERE status IN ('invite', 'active') AND ((p1 = ? AND p2 = ?) OR (p1 = ? AND p2 = ?))").bind(a, b, b, a),
+    env.DB.prepare("DELETE FROM link_state WHERE user_id IN (?, ?)").bind(a, b),
   ]);
+}
+
+// ---------------------------------------------------------------- Badges, notices, saved partners
+
+const BADGES = ["🌱 Newcomer", "😊 Friendly", "⭐ Trusted"];
+function badgeLevel(u) {
+  const likes = (u && u.likes) || 0;
+  const lvl = likes >= 20 ? 2 : likes >= 5 ? 1 : 0;
+  return Math.max(0, lvl - ((u && u.badge_penalty) || 0));
+}
+const badgeText = (u) => BADGES[badgeLevel(u)] + (u && u.streak >= 7 ? " 🔥 Streak" : "");
+
+// User kisi aur chat mein hai to message rok lo, chat khatam hone par milega
+async function notify(env, userId, text, exceptPartner) {
+  const partner = await getPartner(env, userId);
+  if (partner && partner !== exceptPartner) {
+    await env.DB.prepare("INSERT INTO notices (user_id, text, ts) VALUES (?, ?, ?)").bind(userId, text, nowSec()).run();
+    return;
+  }
+  return send(env, userId, text, { reply_markup: MAIN_KEYBOARD });
+}
+
+const reqKb = (prefix, id) => ({ inline_keyboard: [[{ text: "✅ Accept", callback_data: `${prefix}_acc_${id}` }, { text: "❌ Decline", callback_data: `${prefix}_dec_${id}` }]] });
+
+async function savedCount(env, id) {
+  return count(env, "SELECT COUNT(*) FROM saved_partners WHERE user_id = ?", id);
+}
+async function isSaved(env, id, pid) {
+  return !!(await env.DB.prepare("SELECT 1 AS x FROM saved_partners WHERE user_id = ? AND partner_id = ?").bind(id, pid).first());
+}
+async function isBlocked(env, by, who) {
+  return !!(await env.DB.prepare("SELECT 1 AS x FROM blocks WHERE user_id = ? AND blocked_id = ?").bind(by, who).first());
+}
+async function requestedToday(env, from, to) {
+  return (await count(env, "SELECT COUNT(*) FROM saved_requests WHERE from_id = ? AND to_id = ? AND ts > ?", from, to, nowSec() - 86400)) > 0;
+}
+async function defaultName(env, id) {
+  const names = new Set((await env.DB.prepare("SELECT nickname FROM saved_partners WHERE user_id = ?").bind(id).all()).results.map((r) => r.nickname));
+  let k = names.size + 1;
+  while (names.has(`Partner ${k}`)) k++;
+  return `Partner ${k}`;
+}
+
+// Chat khatam hone ke baad: ruke hue updates aur connect requests dikhao
+async function deliverPending(env, userId) {
+  const t = nowSec();
+  const notes = (await env.DB.prepare("SELECT text FROM notices WHERE user_id = ? ORDER BY id LIMIT 10").bind(userId).all()).results;
+  const reqs = (await env.DB.prepare("SELECT id FROM saved_requests WHERE to_id = ? AND kind = 'connect' AND status = 'pending' AND ts > ? ORDER BY id LIMIT 5").bind(userId, t - 86400).all()).results;
+  const total = notes.length + reqs.length;
+  if (!total) return;
+  if (total > 1) await send(env, userId, `📬 You have ${total} pending updates.`);
+  if (notes.length) {
+    await env.DB.prepare("DELETE FROM notices WHERE user_id = ?").bind(userId).run();
+    await send(env, userId, notes.map((n) => n.text).join("\n\n"), { reply_markup: MAIN_KEYBOARD });
+  }
+  for (const r of reqs) {
+    await env.DB.prepare("UPDATE saved_requests SET status = 'shown' WHERE id = ?").bind(r.id).run();
+    await send(env, userId, "🔗 Your saved partner wants to chat with you. Accept?", { reply_markup: reqKb("cn", r.id) });
+  }
+}
+
+// Connect request ka jawab diye bina aage nahi badh sakte
+async function blockedByPending(env, userId, chatId) {
+  const r = await env.DB.prepare("SELECT id FROM saved_requests WHERE to_id = ? AND kind = 'connect' AND status = 'shown' AND ts > ? ORDER BY id LIMIT 1").bind(userId, nowSec() - 86400).first();
+  if (!r) return false;
+  await send(env, chatId, "🔗 Please accept or decline this request first.", { reply_markup: reqKb("cn", r.id) });
+  return true;
+}
+
+async function sweepRequests(env) {
+  const t = nowSec();
+  await env.DB.prepare("UPDATE saved_requests SET status = 'expired' WHERE status IN ('pending', 'shown') AND ts < ?").bind(t - 86400).run();
+  await env.DB.prepare("DELETE FROM notices WHERE ts < ?").bind(t - 3 * 86400).run();
+}
+
+async function onSavePressed(env, userId, chatId) {
+  const partnerId = await getPartner(env, userId);
+  const kb = { reply_markup: MAIN_KEYBOARD };
+  if (!partnerId) return send(env, chatId, "You are not in an active chat to save a partner.", kb);
+  if (await isSaved(env, userId, partnerId)) return send(env, chatId, "This partner is already in your saved list.", kb);
+  if ((await savedCount(env, userId)) >= MAX_SAVED) return send(env, chatId, `Your saved list is full (${MAX_SAVED}). Remove someone first.`, kb);
+  if ((await isBlocked(env, partnerId, userId)) || (await savedCount(env, partnerId)) >= MAX_SAVED) {
+    return send(env, chatId, "The save request could not be sent.", kb);
+  }
+  if (await requestedToday(env, userId, partnerId)) return send(env, chatId, "You already sent a request to this partner today.", kb);
+  const r = await env.DB.prepare("INSERT INTO saved_requests (from_id, to_id, kind, ts, status) VALUES (?, ?, 'save', ?, 'shown') RETURNING id").bind(userId, partnerId, nowSec()).first();
+  await send(env, partnerId, "💾 Your chat partner wants to save you. Accept?", { reply_markup: reqKb("sv", r.id) });
+  return send(env, chatId, "💾 Save request sent. Waiting for your partner's reply...", kb);
+}
+
+async function showSaved(env, userId, chatId) {
+  const { results } = await env.DB.prepare("SELECT partner_id, nickname FROM saved_partners WHERE user_id = ?").bind(userId).all();
+  if (!results.length) return send(env, chatId, "You don't have any saved partners yet.", { reply_markup: MAIN_KEYBOARD });
+  const rows = results.map((r) => [{ text: r.nickname || "Saved Partner", callback_data: `view_saved_${r.partner_id}` }]);
+  return send(env, chatId, `📂 **Your Saved Partners** (${results.length}/${MAX_SAVED})\nSelect one below:`, { reply_markup: { inline_keyboard: rows }, parse_mode: "Markdown" });
+}
+
+// ---------------------------------------------------------------- Likes / dislikes
+
+async function applyRating(env, ratedId, v) {
+  const before = await env.DB.prepare("SELECT likes, badge_penalty FROM users WHERE user_id = ?").bind(ratedId).first();
+  const likes = await count(env, "SELECT COUNT(DISTINCT rater_id) FROM ratings WHERE rated_id = ? AND v = 1", ratedId);
+  const dislikes = await count(env, "SELECT COUNT(DISTINCT rater_id) FROM ratings WHERE rated_id = ? AND v = -1", ratedId);
+  let pen = (before && before.badge_penalty) || 0;
+  if (v === 1 && pen > 0 && likes % 5 === 0) pen -= 1; // achhe behaviour se badge wapas
+  await env.DB.prepare("UPDATE users SET likes = ?, dislikes = ?, badge_penalty = ? WHERE user_id = ?").bind(likes, dislikes, pen, ratedId).run();
+  if (v === 1) {
+    const old = (before && before.likes) || 0;
+    if (old < 5 && likes >= 5) await notify(env, ratedId, "😊 You earned the Friendly badge! People liked chatting with you.");
+    else if (old < 20 && likes >= 20) await notify(env, ratedId, "⭐ You earned the Trusted badge! Thank you for keeping the community great.");
+  }
+}
+
+// ---------------------------------------------------------------- Link verification and spam
+
+const LINK_EMOJI = ["🚗", "🐶", "🍎", "⚽", "🌙", "🎵", "🚀", "🏠"];
+
+function hasLink(msg) {
+  const ents = msg.entities || [];
+  if (ents.some((e) => ["url", "text_link", "mention", "text_mention"].includes(e.type))) return true;
+  return /(https?:\/\/|www\.|t\.me\/|\b[a-z0-9-]{2,}\.(com|net|org|io|me|in|xyz|co|app|link|ly|gg)\b|@[a-z0-9_]{4,})/i.test(msg.text || "");
+}
+
+async function sendChallenge(env, userId, chatId, text) {
+  const target = LINK_EMOJI[Math.floor(Math.random() * LINK_EMOJI.length)];
+  const decoys = LINK_EMOJI.filter((e) => e !== target).sort(() => Math.random() - 0.5).slice(0, 3);
+  const opts = [target, ...decoys].sort(() => Math.random() - 0.5);
+  await env.DB.prepare("UPDATE link_state SET pending = ?, target = ? WHERE user_id = ?").bind(text, target, userId).run();
+  return send(env, chatId, `🔒 Quick check before sending a link.\nTap the ${target}`, {
+    reply_markup: { inline_keyboard: [opts.map((e) => ({ text: e, callback_data: `lv_${LINK_EMOJI.indexOf(e)}` }))] },
+  });
+}
+
+async function handleLinkMessage(env, userId, chatId, partnerId, text) {
+  await env.DB.prepare("INSERT OR IGNORE INTO link_state (user_id) VALUES (?)").bind(userId).run();
+  const ls = await env.DB.prepare("SELECT * FROM link_state WHERE user_id = ?").bind(userId).first();
+  if (ls.flagged) return send(env, chatId, "🚫 Links are blocked for you in this chat.", { reply_markup: MAIN_KEYBOARD });
+  if (ls.verified && ls.links_left > 0) {
+    await send(env, partnerId, text);
+    const left = ls.links_left - 1;
+    const sent = ls.sent + 1;
+    await env.DB.prepare("UPDATE link_state SET links_left = ?, verified = ?, sent = ?, flagged = ? WHERE user_id = ?").bind(left, left > 0 ? 1 : 0, sent, sent >= 6 ? 1 : 0, userId).run();
+    return;
+  }
+  return sendChallenge(env, userId, chatId, text);
+}
+
+// Chat khatam: link spam wali chat ginti mein aati hai, saaf chat se ginti reset
+async function finalizeLinks(env, id) {
+  const ls = await env.DB.prepare("SELECT flagged FROM link_state WHERE user_id = ?").bind(id).first();
+  if (!ls || !ls.flagged) {
+    await env.DB.prepare("UPDATE users SET spam_chats = 0 WHERE user_id = ? AND spam_chats > 0").bind(id).run();
+    return;
+  }
+  const u = await env.DB.prepare("SELECT spam_chats FROM users WHERE user_id = ?").bind(id).first();
+  const n = ((u && u.spam_chats) || 0) + 1;
+  if (n >= 7 + (id % 4)) return applySpamPenalty(env, id); // 7 se 10 chats lagatar
+  await env.DB.prepare("UPDATE users SET spam_chats = ? WHERE user_id = ?").bind(n, id).run();
+}
+
+// 1st = 24h, 2nd = 24h, 3rd = 5-10 din, 4th+ = 1-3 mahine (bot random chunta hai). Permanent nahi.
+async function applySpamPenalty(env, id) {
+  const u = await env.DB.prepare("SELECT spam_offenses FROM users WHERE user_id = ?").bind(id).first();
+  const n = ((u && u.spam_offenses) || 0) + 1;
+  const rnd = (lo, hi) => lo + Math.floor(Math.random() * (hi - lo + 1));
+  const secs = n <= 2 ? 86400 : n === 3 ? rnd(5, 10) * 86400 : rnd(30, 90) * 86400;
+  await env.DB.prepare("UPDATE users SET restrict_until = ?, spam_offenses = ?, spam_chats = 0 WHERE user_id = ?").bind(nowSec() + secs, n, id).run();
+  await env.DB.prepare("DELETE FROM queue WHERE user_id = ?").bind(id).run();
+  await send(env, id, `🚫 You have been restricted for link spam.\nTime left: ${timeLeft(secs)}\nPlease follow the rules.`);
+}
+
+async function expireRestrictions(env) {
+  const { results } = await env.DB.prepare("SELECT user_id FROM users WHERE restrict_until > 0 AND restrict_until <= ? LIMIT 20").bind(nowSec()).all();
+  for (const r of results) {
+    await env.DB.prepare("UPDATE users SET restrict_until = 0 WHERE user_id = ?").bind(r.user_id).run();
+    await send(env, r.user_id, "✅ Your restriction has ended. Please follow the rules to avoid another one.");
+  }
+}
+
+// ---------------------------------------------------------------- Tic-Tac-Toe
+
+const WIN_LINES = [[0, 1, 2], [3, 4, 5], [6, 7, 8], [0, 3, 6], [1, 4, 7], [2, 5, 8], [0, 4, 8], [2, 4, 6]];
+const SYM = { X: "❌", O: "⭕", "-": "⬜" };
+const TURN_SECONDS = 30;
+
+function winnerOf(b) {
+  for (const [x, y, z] of WIN_LINES) if (b[x] !== "-" && b[x] === b[y] && b[x] === b[z]) return b[x];
+  return null;
+}
+const getGame = (env, id) => env.DB.prepare("SELECT * FROM games WHERE id = ?").bind(id).first();
+
+function boardKb(g, forUser) {
+  const mine = g.status === "active" && g.turn === forUser;
+  const rows = [];
+  for (let r = 0; r < 3; r++) {
+    const row = [];
+    for (let c = 0; c < 3; c++) {
+      const i = r * 3 + c;
+      row.push({ text: SYM[g.board[i]], callback_data: g.board[i] === "-" && mine ? `g_mv_${g.id}_${i}` : `g_wait_${g.id}` });
+    }
+    rows.push(row);
+  }
+  if (g.status === "done") rows.push([{ text: "🔁 Rematch", callback_data: `g_re_${g.id}` }]);
+  return { inline_keyboard: rows };
+}
+function gameText(g, forUser, note) {
+  if (g.status === "done") return `🎮 Tic-Tac-Toe\n${note || "Game over."}`;
+  const you = g.xid === forUser ? "❌" : "⭕";
+  return `🎮 Tic-Tac-Toe\nYou are ${you}\n${g.turn === forUser ? `Your turn (${TURN_SECONDS}s)` : "Partner's turn"}`;
+}
+async function renderGame(env, g, notes) {
+  for (const [uid, mid] of [[g.p1, g.m1], [g.p2, g.m2]]) {
+    if (mid) await editText(env, uid, mid, gameText(g, uid, notes && notes[uid]), { reply_markup: boardKb(g, uid) });
+  }
+}
+
+async function createInvite(env, a, b) {
+  const t = nowSec();
+  const r = await env.DB.prepare("INSERT INTO games (p1, p2, board, xid, turn, status, last_act, turn_ts) VALUES (?, ?, '---------', ?, ?, 'invite', ?, ?) RETURNING id").bind(a, b, a, a, t, t).first();
+  return r.id;
+}
+
+async function handlePlay(env, userId, chatId) {
+  const kb = { reply_markup: MAIN_KEYBOARD };
+  const partnerId = await getPartner(env, userId);
+  if (!partnerId) return send(env, chatId, "You are not in an active chat. Start a chat first, then tap Play Game.", kb);
+  const existing = await env.DB.prepare("SELECT id FROM games WHERE status IN ('invite', 'active') AND ((p1 = ?1 AND p2 = ?2) OR (p1 = ?2 AND p2 = ?1)) LIMIT 1").bind(userId, partnerId).first();
+  if (existing) return send(env, chatId, "A game is already running or waiting for a reply.", kb);
+  const id = await createInvite(env, userId, partnerId);
+  await send(env, partnerId, "🎮 Your partner wants to play Tic-Tac-Toe. Accept?", { reply_markup: reqKb("g", id) });
+  return send(env, chatId, "🎮 Game invite sent. Waiting for your partner...", kb);
+}
+
+function scheduleTurnTimer(env, id, stamp) {
+  if (!env.__wait || env.NO_TIMERS) return;
+  env.__wait((async () => { await sleep(env, 28000); await expireTurn(env, id, stamp); })());
+}
+
+async function launchGame(env, id) {
+  const g = await getGame(env, id);
+  const first = Math.random() < 0.5 ? g.p1 : g.p2; // pehli chal random
+  const t = nowSec();
+  await env.DB.prepare("UPDATE games SET status = 'active', xid = ?, turn = ?, last_act = ?, turn_ts = ?, miss1 = 0, miss2 = 0 WHERE id = ?").bind(first, first, t, t, id).run();
+  Object.assign(g, { status: "active", xid: first, turn: first, last_act: t, turn_ts: t, miss1: 0, miss2: 0 });
+  const r1 = await send(env, g.p1, gameText(g, g.p1), { reply_markup: boardKb(g, g.p1) });
+  const r2 = await send(env, g.p2, gameText(g, g.p2), { reply_markup: boardKb(g, g.p2) });
+  g.m1 = (r1.result && r1.result.message_id) || null;
+  g.m2 = (r2.result && r2.result.message_id) || null;
+  await env.DB.prepare("UPDATE games SET m1 = ?, m2 = ? WHERE id = ?").bind(g.m1, g.m2, id).run();
+  scheduleTurnTimer(env, id, t);
+}
+
+async function finishGame(env, g, winSym, reason) {
+  g.status = "done";
+  await env.DB.prepare("UPDATE games SET status = 'done', board = ? WHERE id = ?").bind(g.board, g.id).run();
+  const notes = {};
+  for (const uid of [g.p1, g.p2]) {
+    if (reason === "inactive") notes[uid] = "⌛ Game ended (no response).";
+    else if (!winSym) notes[uid] = "🤝 It's a draw!";
+    else notes[uid] = (uid === g.xid) === (winSym === "X") ? "🏆 You won!" : "😔 Your partner won.";
+  }
+  await renderGame(env, g, notes);
+}
+
+// 30 second mein chal nahi chali: turn samne wale ko. Ek khiladi 3 baar chuka ya 60 second kuch nahi hua to game band.
+async function passTurn(env, g) {
+  const now = nowSec();
+  const col = g.turn === g.p1 ? "miss1" : "miss2";
+  const misses = (g[col] || 0) + 1;
+  if (misses >= 3 || now - g.last_act >= 55) return finishGame(env, g, null, "inactive");
+  const other = g.turn === g.p1 ? g.p2 : g.p1;
+  await env.DB.prepare(`UPDATE games SET turn = ?, turn_ts = ?, ${col} = ? WHERE id = ?`).bind(other, now, misses, g.id).run();
+  g.turn = other; g.turn_ts = now; g[col] = misses;
+  await renderGame(env, g);
+  scheduleTurnTimer(env, g.id, now);
+}
+async function expireTurn(env, id, stamp) {
+  const g = await getGame(env, id);
+  if (!g || g.status !== "active" || g.turn_ts !== stamp) return;
+  return passTurn(env, g);
+}
+async function sweepGames(env) {
+  const t = nowSec();
+  await env.DB.prepare("UPDATE games SET status = 'done' WHERE status = 'invite' AND last_act < ?").bind(t - 600).run();
+  const { results } = await env.DB.prepare("SELECT * FROM games WHERE status = 'active' AND last_act < ? LIMIT 5").bind(t - 90).all();
+  for (const g of results) await finishGame(env, g, null, "inactive");
+}
+
+async function onGameCallback(env, cq, userId, chatId, mid, edit, answer, data) {
+  const parts = data.split("_");
+  const kind = parts[1];
+  let g = await getGame(env, Number(parts[2]));
+  if (!g || (g.p1 !== userId && g.p2 !== userId)) return answer("This game is not available.");
+
+  if (kind === "acc" || kind === "dec") {
+    if (g.status !== "invite" || g.p2 !== userId) return answer("This invite is no longer valid.");
+    if (kind === "dec") {
+      await env.DB.prepare("UPDATE games SET status = 'done' WHERE id = ?").bind(g.id).run();
+      await answer();
+      await edit("You declined the game.");
+      return send(env, g.p1, "🎮 Your partner declined the game.");
+    }
+    if ((await getPartner(env, userId)) !== g.p1) {
+      await env.DB.prepare("UPDATE games SET status = 'done' WHERE id = ?").bind(g.id).run();
+      return answer("The chat has ended.");
+    }
+    await answer();
+    await edit("🎮 Game accepted. Good luck!");
+    return launchGame(env, g.id);
+  }
+
+  if (g.status === "active" && nowSec() - g.turn_ts >= TURN_SECONDS && (kind === "wait" || kind === "mv")) {
+    await passTurn(env, g);
+    g = await getGame(env, g.id);
+  }
+
+  if (kind === "wait") return answer(g.status === "done" ? "Game over." : "Wait for your turn.");
+
+  if (kind === "mv") {
+    if (g.status !== "active") return answer("This game has ended.");
+    if (g.turn !== userId) return answer("It is not your turn.");
+    const i = Number(parts[3]);
+    if (!(i >= 0 && i <= 8) || g.board[i] !== "-") return answer("That square is taken.");
+    const sym = g.xid === userId ? "X" : "O";
+    g.board = g.board.slice(0, i) + sym + g.board.slice(i + 1);
+    const w = winnerOf(g.board);
+    const now = nowSec();
+    await answer();
+    if (w || !g.board.includes("-")) return finishGame(env, g, w, "end");
+    const other = g.p1 === userId ? g.p2 : g.p1;
+    const col = g.p1 === userId ? "miss1" : "miss2";
+    await env.DB.prepare(`UPDATE games SET board = ?, turn = ?, turn_ts = ?, last_act = ?, ${col} = 0 WHERE id = ?`).bind(g.board, other, now, now, g.id).run();
+    Object.assign(g, { turn: other, turn_ts: now, last_act: now, [col]: 0 });
+    await renderGame(env, g);
+    return scheduleTurnTimer(env, g.id, now);
+  }
+
+  if (kind === "re") {
+    if (g.status !== "done") return answer();
+    const other = g.p1 === userId ? g.p2 : g.p1;
+    if ((await getPartner(env, userId)) !== other) return answer("The chat has ended.");
+    const existing = await env.DB.prepare("SELECT id FROM games WHERE status IN ('invite', 'active') AND ((p1 = ?1 AND p2 = ?2) OR (p1 = ?2 AND p2 = ?1)) LIMIT 1").bind(userId, other).first();
+    if (existing) return answer("A rematch is already pending.");
+    await answer("Rematch request sent.");
+    const id = await createInvite(env, userId, other);
+    return send(env, other, "🎮 Your partner wants a rematch. Accept?", { reply_markup: reqKb("g", id) });
+  }
+  return answer();
 }
 
 // ---------------------------------------------------------------- Matching
 
 // userId queue mein hona chahiye. Sirf apne se PEHLE se wait kar rahe user ko uthata hai
 // (isse do log ek doosre ko ek saath uthane ki koshish mein atakte nahi), phir khud ko queue se hatata hai.
-async function claimPair(env, userId) {
+async function claimPair(env, userId, strict = false) {
   const now = nowSec();
   const partner = await env.DB.prepare(
     `DELETE FROM queue WHERE user_id = (
-       SELECT q.user_id FROM queue q, (SELECT ts AS mts FROM queue WHERE user_id = ?1) m
+       SELECT q.user_id FROM queue q JOIN users u ON u.user_id = q.user_id, (SELECT ts AS mts FROM queue WHERE user_id = ?1) m
        WHERE q.user_id != ?1
          AND (q.ts < m.mts OR (q.ts = m.mts AND q.user_id < ?1))
          AND q.user_id NOT IN (SELECT partner_id FROM recent WHERE user_id = ?1 AND ts + gap > ?2)
          AND q.user_id NOT IN (SELECT user_id FROM recent WHERE partner_id = ?1 AND ts + gap > ?2)
-       ORDER BY q.ts, q.user_id LIMIT 1
+         AND q.user_id NOT IN (SELECT blocked_id FROM blocks WHERE user_id = ?1)
+         AND q.user_id NOT IN (SELECT user_id FROM blocks WHERE blocked_id = ?1)
+         AND (?3 = 0 OR u.language IS NULL OR u.language = 'Any' OR (SELECT language FROM users WHERE user_id = ?1) IN ('Any', u.language))
+       ORDER BY q.ts - (CASE WHEN COALESCE(u.likes, 0) >= 20 THEN 20 WHEN COALESCE(u.likes, 0) >= 5 THEN 10 ELSE 0 END) + MIN(COALESCE(u.dislikes, 0), 20), q.user_id LIMIT 1
      ) RETURNING user_id, ts`
-  ).bind(userId, now).first();
+  ).bind(userId, now, strict ? 1 : 0).first();
   if (!partner) return null;
 
   const self = await env.DB.prepare("DELETE FROM queue WHERE user_id = ? RETURNING user_id").bind(userId).first();
@@ -332,14 +709,21 @@ async function claimPair(env, userId) {
     env.DB.prepare("INSERT OR REPLACE INTO chats (user_id, partner_id) VALUES (?, ?)").bind(a, b),
     env.DB.prepare("INSERT OR REPLACE INTO chats (user_id, partner_id) VALUES (?, ?)").bind(b, a),
     env.DB.prepare("DELETE FROM recent WHERE user_id IN (?, ?)").bind(a, b),
+    env.DB.prepare("DELETE FROM link_state WHERE user_id IN (?, ?)").bind(a, b),
     env.DB.prepare("INSERT INTO daily_stats (day, chats) VALUES (?, 1) ON CONFLICT(day) DO UPDATE SET chats = chats + 1").bind(dayKey(now)),
   ]);
   return b;
 }
 
-async function announceMatch(env, a, b) {
-  await send(env, a, MATCH_MSG, { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
-  await send(env, b, MATCH_MSG, { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
+async function announceMatch(env, a, b, title) {
+  const [pa, pb] = await Promise.all([getProfile(env, a), getProfile(env, b)]);
+  const head = title || "**Connected with a stranger.** Say hello! 👋";
+  const msgFor = (me, other) => {
+    const hello = me && badgeLevel(me) >= 1 ? `⭐ Welcome back, ${BADGES[badgeLevel(me)]} user!\n` : "";
+    return `${hello}${head}\nPartner badge: ${badgeText(other)}\nUse the buttons below to control the chat.`;
+  };
+  await send(env, a, msgFor(pa, pb), { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
+  await send(env, b, msgFor(pb, pa), { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
 }
 
 // Cron: queue mein atke hue log (gap khatam hone ke baad) ko jod deta hai
@@ -359,6 +743,7 @@ async function searchPartner(env, userId, chatId) {
   if (!isComplete(profile)) {
     return reply("Please complete your profile first by typing /start");
   }
+  if (await blockedByPending(env, userId, chatId)) return;
   if (await getPartner(env, userId)) {
     return reply(`You are already in a chat. Use /stop or ${BTN_NEXT}.`);
   }
@@ -367,17 +752,21 @@ async function searchPartner(env, userId, chatId) {
   }
 
   await env.DB.prepare("INSERT OR IGNORE INTO queue (user_id, ts) VALUES (?, ?)").bind(userId, nowSec()).run();
-  let partner = null;
-  for (let i = 0; i < 3 && !partner; i++) {
-    if (i > 0 && !(await inQueue(env, userId))) break; // kisi ne match kar liya
-    partner = await claimPair(env, userId);
-  }
+  let partner = await claimPair(env, userId, true); // pehle same language wale ko try
   if (partner) {
     return announceMatch(env, userId, partner);
   }
   if (!(await inQueue(env, userId))) return; // kisi aur ne humein match kar diya, wahi message bhej dega
 
-  await reply("**Searching for a partner...** Please wait.", { parse_mode: "Markdown" });
+  await reply("🔍 **Searching for a partner...** Please wait.", { parse_mode: "Markdown" });
+
+  // 1-2 second same language ka intezaar, phir kisi se bhi
+  await sleep(env, 1500);
+  if (await inQueue(env, userId)) {
+    let p2 = await claimPair(env, userId, true);
+    if (!p2 && (await inQueue(env, userId))) p2 = await claimPair(env, userId, false);
+    if (p2) return announceMatch(env, userId, p2);
+  }
 
   // Agar abhi gap chal raha hai (pichle partner se), to gap khatam hote hi ek baar aur try karo
   const rec = await env.DB.prepare("SELECT ts, gap FROM recent WHERE user_id = ?").bind(userId).first();
@@ -396,7 +785,10 @@ async function searchPartner(env, userId, chatId) {
 // ---------------------------------------------------------------- Stop / Next / Feedback
 
 function feedbackKeyboard(partnerId, withSearch) {
-  const rows = [[{ text: "⚠️ Report", callback_data: `rpt_${partnerId}` }]];
+  const rows = [
+    [{ text: "👍 Like", callback_data: `lk_${partnerId}` }, { text: "👎 Dislike", callback_data: `dl_${partnerId}` }],
+    [{ text: "⚠️ Report", callback_data: `rpt_${partnerId}` }],
+  ];
   if (withSearch) rows.push([{ text: "Search New Partner", callback_data: "action_search" }]);
   return { inline_keyboard: rows };
 }
@@ -421,6 +813,8 @@ async function stopChat(env, userId, chatId) {
 
   await send(env, partnerId, "**Your partner stopped the chat.**\nType /search to find a new partner.", { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
   await sendFeedback(env, partnerId, userId, true);
+  await deliverPending(env, partnerId);
+  await deliverPending(env, userId);
 }
 
 async function nextPartner(env, userId, chatId) {
@@ -432,6 +826,8 @@ async function nextPartner(env, userId, chatId) {
 
     await send(env, partnerId, "**Your partner skipped the chat.**\nType /search to find a new partner.", { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
     await sendFeedback(env, partnerId, userId, true);
+    await deliverPending(env, partnerId);
+    await deliverPending(env, userId);
   }
   await env.DB.prepare("DELETE FROM queue WHERE user_id = ?").bind(userId).run();
   return searchPartner(env, userId, chatId);
@@ -503,6 +899,9 @@ async function recordReport(env, reporter, reported, reason, extra = {}) {
   const since = Math.max(t - 7 * 86400, target.report_floor || 0);
   const distinct = await count(env, "SELECT COUNT(DISTINCT reporter_id) FROM reports WHERE reported_id = ? AND ts > ? AND reason != ?", reported, since, REASONS.ua);
 
+  if (distinct === cfg(env, "WARN_AFTER_REPORTS")) {
+    await env.DB.prepare("UPDATE users SET badge_penalty = MIN(2, COALESCE(badge_penalty, 0) + 1), streak = 0 WHERE user_id = ?").bind(reported).run();
+  }
   if (distinct >= cfg(env, "AUTO_BAN_REPORTS")) {
     const res = await banUser(env, reported, `Auto-ban: reported by ${distinct} users`);
     for (const a of adminIds(env)) {
@@ -916,6 +1315,16 @@ async function gate(env, user, chatId, profile, input = {}) {
       return false;
     }
   }
+  if (profile && profile.restrict_until && !admin) {
+    const t0 = nowSec();
+    if (profile.restrict_until > t0) {
+      await send(env, chatId, `🚫 You are restricted for now.\nTime left: ${timeLeft(profile.restrict_until - t0)}`);
+      return false;
+    }
+    await env.DB.prepare("UPDATE users SET restrict_until = 0 WHERE user_id = ?").bind(user.id).run();
+    profile.restrict_until = 0;
+    await send(env, chatId, "✅ Your restriction has ended. Please follow the rules to avoid another one.");
+  }
   const s = await getSettings(env);
   if (s.maintenance === "1" && !admin) {
     await send(env, chatId, "The bot is under maintenance. Please try again in a little while.");
@@ -925,6 +1334,11 @@ async function gate(env, user, chatId, profile, input = {}) {
     const t = nowSec();
     if (!profile.last_seen || t - profile.last_seen > 300) {
       await env.DB.prepare("UPDATE users SET last_seen = ? WHERE user_id = ?").bind(t, user.id).run();
+    }
+    const today = dayKey(t);
+    if (profile.last_active_day !== today) {
+      const streak = profile.last_active_day === dayKey(t - 86400) ? (profile.streak || 0) + 1 : 1;
+      await env.DB.prepare("UPDATE users SET streak = ?, last_active_day = ? WHERE user_id = ?").bind(streak, today, user.id).run();
     }
   }
   return true;
@@ -948,7 +1362,7 @@ async function onCommand(env, msg) {
     const profile = await getProfile(env, user.id);
     if (isComplete(profile)) {
       await setField(env, user, "username", user.username ?? null);
-      return send(env, chatId, "**Welcome back to Nexus Anonymous Chat!**\n\nUse the buttons below:", { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
+      return send(env, chatId, `**Welcome back to Nexus Anonymous Chat!** 🌍\nYour badge: ${badgeText(profile)}\n\nUse the buttons below:`, { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
     }
     const keyboard = {
       inline_keyboard: [
@@ -956,11 +1370,29 @@ async function onCommand(env, msg) {
         [{ text: "Other", callback_data: "gender_Other" }],
       ],
     };
-    return send(env, chatId, "**Welcome to Nexus Anonymous Chat!**\n\nPlease select your **Gender**:", { reply_markup: keyboard, parse_mode: "Markdown" });
+    return send(env, chatId, "**Welcome to Nexus Anonymous Chat!** 🌍\n\nMeet people from around the world.\nChat kindly to earn badges: 🌱 → 😊 → ⭐\n\nPlease select your **Gender**:", { reply_markup: keyboard, parse_mode: "Markdown" });
   }
 
   if (cmd === "search") return searchPartner(env, user.id, chatId);
   if (cmd === "stop") return stopChat(env, user.id, chatId);
+  if (cmd === "next") return nextPartner(env, user.id, chatId);
+  if (cmd === "play") return handlePlay(env, user.id, chatId);
+  if (cmd === "profile") {
+    const p = await getProfile(env, user.id);
+    if (!isComplete(p)) return send(env, chatId, "Please complete your profile first by typing /start");
+    const lvl = badgeLevel(p);
+    const likes = p.likes || 0;
+    const prog = lvl >= 2 ? "You have the top badge! 🎉" : `Next badge: ${likes}/${likes >= 5 ? 20 : 5} likes`;
+    return send(env, chatId, [
+      "👤 Your profile",
+      `Badge: ${badgeText(p)}`,
+      prog + (p.badge_penalty > 0 ? "\n(Your badge was lowered by reports. Keep getting likes to recover.)" : ""),
+      `Likes: ${likes}   Streak: ${p.streak || 0} day(s)`,
+      `Gender: ${p.gender}   Age: ${p.age}`,
+      `Language: ${p.language}`,
+      `Saved partners: ${await savedCount(env, user.id)}/${MAX_SAVED}`,
+    ].join("\n"), { reply_markup: MAIN_KEYBOARD });
+  }
   if (cmd === "cancel") {
     await clearState(env, user.id);
     return send(env, chatId, "Cancelled.", { reply_markup: MAIN_KEYBOARD });
@@ -972,6 +1404,9 @@ async function onCommand(env, msg) {
       "**Commands**",
       "/start - set up your profile",
       "/search - find a partner",
+      "/next - skip to a new partner",
+      "/play - play Tic-Tac-Toe with your partner",
+      "/profile - see your badge and progress",
       "/stop - end the chat or stop searching",
       "/report - report your current partner and end the chat",
       "/myid - show your Telegram ID",
@@ -1038,7 +1473,7 @@ async function onMessage(env, msg) {
   if (msg.chat.type && msg.chat.type !== "private") return;
   const chatId = msg.chat.id;
   const userId = msg.from.id;
-  const text = msg.text;
+  const text = LEGACY_BTN[msg.text] ?? msg.text;
 
   const profile = await getProfile(env, userId);
   if (!(await gate(env, msg.from, chatId, profile, { text }))) return;
@@ -1051,44 +1486,23 @@ async function onMessage(env, msg) {
     if (text && BUTTONS.includes(text)) await clearState(env, userId);
     else return handleUaReport(env, msg, st);
   }
-
-  // Nickname ka intezaar
-  if (profile && profile.waiting_nick && text && !BUTTONS.includes(text)) {
-    const partnerId = profile.waiting_nick;
-    const nickname = text.trim();
-    await env.DB.batch([
-      env.DB.prepare("INSERT OR REPLACE INTO saved_partners (user_id, partner_id, nickname) VALUES (?, ?, ?)").bind(userId, partnerId, nickname),
-      env.DB.prepare("INSERT OR IGNORE INTO saved_partners (user_id, partner_id, nickname) VALUES (?, ?, ?)").bind(partnerId, userId, "Anonymous Partner"),
-      env.DB.prepare("UPDATE users SET waiting_nick = NULL WHERE user_id = ?").bind(userId),
-    ]);
-    await send(env, chatId, `**Partner saved successfully with nickname:** \`${nickname}\``, { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
-    await send(env, partnerId, "**Your partner accepted your save request and saved you too.** Check your 'Saved Partners'.", { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
-    return;
+  if (st && st.kind === "rename") {
+    if (!text || BUTTONS.includes(text)) await clearState(env, userId);
+    else {
+      const nick = text.replace(/[*_`\[\]]/g, "").trim().slice(0, 20);
+      if (!nick) return send(env, chatId, "Please send a valid nickname.");
+      await env.DB.prepare("UPDATE saved_partners SET nickname = ? WHERE user_id = ? AND partner_id = ?").bind(nick, userId, Number(st.data)).run();
+      await clearState(env, userId);
+      return send(env, chatId, `✅ Renamed to ${nick}.`, { reply_markup: MAIN_KEYBOARD });
+    }
   }
 
   if (text === BTN_NEXT) return nextPartner(env, userId, chatId);
   if (text === BTN_STOP) return stopChat(env, userId, chatId);
 
-  if (text === BTN_SAVE) {
-    const partnerId = await getPartner(env, userId);
-    if (!partnerId) {
-      return send(env, chatId, "You are not in an active chat to save a partner.", { reply_markup: MAIN_KEYBOARD });
-    }
-    const keyboard = {
-      inline_keyboard: [[{ text: "Accept", callback_data: `accept_save_${userId}` }, { text: "Decline", callback_data: `decline_save_${userId}` }]],
-    };
-    await send(env, partnerId, "**Your chat partner wants to save you.** Do you want to accept?", { reply_markup: keyboard, parse_mode: "Markdown" });
-    return send(env, chatId, "**Save request sent to your partner.** Waiting for response...", { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
-  }
-
-  if (text === BTN_SAVED) {
-    const { results } = await env.DB.prepare("SELECT partner_id, nickname FROM saved_partners WHERE user_id = ?").bind(userId).all();
-    if (!results.length) {
-      return send(env, chatId, "You don't have any saved partners yet.", { reply_markup: MAIN_KEYBOARD });
-    }
-    const rows = results.map((r) => [{ text: r.nickname || "Saved Partner", callback_data: `view_saved_${r.partner_id}` }]);
-    return send(env, chatId, "**Your Saved Partners:**\nSelect one below:", { reply_markup: { inline_keyboard: rows }, parse_mode: "Markdown" });
-  }
+  if (text === BTN_SAVE) return onSavePressed(env, userId, chatId);
+  if (text === BTN_SAVED) return showSaved(env, userId, chatId);
+  if (text === BTN_PLAY) return handlePlay(env, userId, chatId);
 
   // Normal chat message
   const partnerId = await getPartner(env, userId);
@@ -1097,6 +1511,7 @@ async function onMessage(env, msg) {
   }
 
   if (text) {
+    if (hasLink(msg)) return handleLinkMessage(env, userId, chatId, partnerId, text);
     await send(env, partnerId, text);
     return;
   }
@@ -1228,6 +1643,8 @@ async function onCallback(env, cq) {
     return;
   }
 
+  if (data.startsWith("g_")) return onGameCallback(env, cq, userId, chatId, mid, edit, answer, data);
+
   await answer();
 
   // ---- profile setup
@@ -1248,8 +1665,9 @@ async function onCallback(env, cq) {
     await setField(env, user, "age", age);
     const keyboard = {
       inline_keyboard: [
-        [{ text: "Hindi", callback_data: "lang_Hindi" }, { text: "English", callback_data: "lang_English" }],
-        [{ text: "Hinglish", callback_data: "lang_Hinglish" }, { text: "Other", callback_data: "lang_Other" }],
+        [{ text: "English", callback_data: "lang_English" }, { text: "Spanish", callback_data: "lang_Spanish" }],
+        [{ text: "French", callback_data: "lang_French" }, { text: "Arabic", callback_data: "lang_Arabic" }],
+        [{ text: "Russian", callback_data: "lang_Russian" }, { text: "Any", callback_data: "lang_Any" }],
       ],
     };
     return edit(`Selected Age: **${age}**\n\nFinally, select your **Language**:`, { reply_markup: keyboard, parse_mode: "Markdown" });
@@ -1271,6 +1689,43 @@ async function onCallback(env, cq) {
     return searchPartner(env, userId, chatId);
   }
 
+  // ---- like / dislike (report se bilkul alag)
+  if (data.startsWith("lk_") || data.startsWith("dl_")) {
+    const pid = Number(data.split("_")[1]);
+    if (!pid || pid === userId) return;
+    const v = data.startsWith("lk_") ? 1 : -1;
+    if (mid) {
+      const kb = ((msg.reply_markup && msg.reply_markup.inline_keyboard) || []).filter((r) => !r.some((b) => /^(lk|dl)_/.test(b.callback_data || "")));
+      await tg(env, "editMessageReplyMarkup", { chat_id: chatId, message_id: mid, reply_markup: { inline_keyboard: kb } });
+    }
+    const ins = await env.DB.prepare("INSERT OR IGNORE INTO ratings (rater_id, rated_id, v, day) VALUES (?, ?, ?, ?) RETURNING rater_id").bind(userId, pid, v, dayKey(nowSec())).first();
+    if (ins) await applyRating(env, pid, v);
+    return;
+  }
+
+  // ---- link verification
+  if (data.startsWith("lv_")) {
+    const idx = Number(data.split("_")[1]);
+    const ls = await env.DB.prepare("SELECT * FROM link_state WHERE user_id = ?").bind(userId).first();
+    if (!ls || !ls.target || !ls.pending) return edit("This check has expired.");
+    const partnerId = await getPartner(env, userId);
+    if (!partnerId) return edit("The chat has ended.");
+    if (LINK_EMOJI[idx] === ls.target) {
+      await send(env, partnerId, ls.pending);
+      const sent = ls.sent + 1;
+      await env.DB.prepare("UPDATE link_state SET verified = 1, links_left = 1, tries = 0, sent = ?, flagged = ?, pending = NULL, target = NULL WHERE user_id = ?").bind(sent, sent >= 6 ? 1 : 0, userId).run();
+      return edit("✅ Verified. Your link was sent.");
+    }
+    const tries = ls.tries + 1;
+    if (tries >= 5) {
+      await env.DB.prepare("UPDATE link_state SET tries = ?, flagged = 1, pending = NULL, target = NULL WHERE user_id = ?").bind(tries, userId).run();
+      return edit("🚫 Too many wrong answers. Links are blocked for you in this chat.");
+    }
+    await env.DB.prepare("UPDATE link_state SET tries = ? WHERE user_id = ?").bind(tries, userId).run();
+    await edit("❌ Wrong answer. Try again.");
+    return sendChallenge(env, userId, chatId, ls.pending);
+  }
+
   // ---- report: pehle sirf ek "Report" button, dabane par reasons
   if (data === "rpt_skip") {
     const st = await getState(env, userId);
@@ -1284,7 +1739,9 @@ async function onCallback(env, cq) {
   if (data.startsWith("rpt_") || data.startsWith("rptb_")) {
     const pid = Number(data.split("_")[1]);
     if (!pid || !mid) return;
-    const keep = ((msg.reply_markup && msg.reply_markup.inline_keyboard) || []).filter((r) => r.some((b) => b.callback_data === "action_search"));
+    const all = (msg.reply_markup && msg.reply_markup.inline_keyboard) || [];
+    const likeRows = all.filter((r) => r.some((b) => /^(lk|dl)_/.test(b.callback_data || "")));
+    const keep = all.filter((r) => r.some((b) => b.callback_data === "action_search"));
     const rows = data.startsWith("rptb_")
       ? [[{ text: "⚠️ Report", callback_data: `rpt_${pid}` }]]
       : [
@@ -1294,7 +1751,7 @@ async function onCallback(env, cq) {
           [{ text: REASONS.rp, callback_data: `fb_rp_${pid}` }],
           [{ text: "Back", callback_data: `rptb_${pid}` }],
         ];
-    return tg(env, "editMessageReplyMarkup", { chat_id: chatId, message_id: mid, reply_markup: { inline_keyboard: [...rows, ...keep] } });
+    return tg(env, "editMessageReplyMarkup", { chat_id: chatId, message_id: mid, reply_markup: { inline_keyboard: [...likeRows, ...rows, ...keep] } });
   }
 
   // ---- report reason chosen
@@ -1338,31 +1795,103 @@ async function onCallback(env, cq) {
     return send(env, senderId, `**Your partner declined your ${CAT_NAME[cat]} request.**`, { parse_mode: "Markdown" });
   }
 
-  // ---- save partner
-  if (data.startsWith("accept_save_")) {
-    const senderId = Number(data.split("_")[2]);
-    await setField(env, user, "waiting_nick", senderId);
-    return edit("**Accepted.** Now please send a **Nickname** (secret name) for this partner in chat:", { parse_mode: "Markdown" });
+  // ---- save partner (dono ki marzi se)
+  if (data.startsWith("sv_acc_") || data.startsWith("sv_dec_")) {
+    const rid = Number(data.split("_")[2]);
+    const r = await env.DB.prepare("SELECT * FROM saved_requests WHERE id = ?").bind(rid).first();
+    if (!r || r.to_id !== userId || r.kind !== "save" || r.status !== "shown" || r.ts < nowSec() - 86400) return edit("This request has expired.");
+    if (data.startsWith("sv_dec_")) {
+      await env.DB.prepare("UPDATE saved_requests SET status = 'declined' WHERE id = ?").bind(rid).run();
+      await edit("You declined the save request.");
+      return notify(env, r.from_id, "Your save request was not accepted.", userId);
+    }
+    if ((await savedCount(env, userId)) >= MAX_SAVED || (await savedCount(env, r.from_id)) >= MAX_SAVED) {
+      await env.DB.prepare("UPDATE saved_requests SET status = 'expired' WHERE id = ?").bind(rid).run();
+      return edit(`Could not save: a saved list is full (${MAX_SAVED}).`);
+    }
+    const nameMine = await defaultName(env, userId);
+    const nameTheirs = await defaultName(env, r.from_id);
+    await env.DB.batch([
+      env.DB.prepare("INSERT OR REPLACE INTO saved_partners (user_id, partner_id, nickname) VALUES (?, ?, ?)").bind(userId, r.from_id, nameMine),
+      env.DB.prepare("INSERT OR REPLACE INTO saved_partners (user_id, partner_id, nickname) VALUES (?, ?, ?)").bind(r.from_id, userId, nameTheirs),
+      env.DB.prepare("UPDATE saved_requests SET status = 'accepted' WHERE id = ?").bind(rid),
+    ]);
+    await edit(`✅ Saved as ${nameMine}. You can rename it in Saved Partners.`);
+    return notify(env, r.from_id, `💾 Your saved partner accepted your request. Saved as ${nameTheirs}.`, userId);
   }
 
-  if (data.startsWith("decline_save_")) {
-    const senderId = Number(data.split("_")[2]);
-    await edit("**You declined the save request.**", { parse_mode: "Markdown" });
-    return send(env, senderId, "**Your partner declined the save request.**", { parse_mode: "Markdown" });
+  // ---- connect request (saved list se)
+  if (data.startsWith("cn_acc_") || data.startsWith("cn_dec_")) {
+    const rid = Number(data.split("_")[2]);
+    const r = await env.DB.prepare("SELECT * FROM saved_requests WHERE id = ?").bind(rid).first();
+    if (!r || r.to_id !== userId || r.kind !== "connect" || r.status !== "shown" || r.ts < nowSec() - 86400) return edit("This request has expired.");
+    if (data.startsWith("cn_dec_")) {
+      await env.DB.prepare("UPDATE saved_requests SET status = 'declined' WHERE id = ?").bind(rid).run();
+      await edit("You declined the request.");
+      return notify(env, r.from_id, "Your connect request was not accepted.", userId);
+    }
+    if ((await getPartner(env, userId)) || (await getPartner(env, r.from_id))) {
+      await env.DB.prepare("UPDATE saved_requests SET status = 'expired' WHERE id = ?").bind(rid).run();
+      return edit("This request is no longer available (someone is in another chat).");
+    }
+    const a = r.from_id;
+    const b = userId;
+    await env.DB.batch([
+      env.DB.prepare("UPDATE saved_requests SET status = 'accepted' WHERE id = ?").bind(rid),
+      env.DB.prepare("DELETE FROM queue WHERE user_id IN (?, ?)").bind(a, b),
+      env.DB.prepare("INSERT OR REPLACE INTO chats (user_id, partner_id) VALUES (?, ?)").bind(a, b),
+      env.DB.prepare("INSERT OR REPLACE INTO chats (user_id, partner_id) VALUES (?, ?)").bind(b, a),
+      env.DB.prepare("DELETE FROM recent WHERE user_id IN (?, ?)").bind(a, b),
+      env.DB.prepare("INSERT INTO daily_stats (day, chats) VALUES (?, 1) ON CONFLICT(day) DO UPDATE SET chats = chats + 1").bind(dayKey(nowSec())),
+    ]);
+    await edit("✅ Accepted.");
+    return announceMatch(env, a, b, "**Connected with your saved partner.** 🔗");
   }
 
   if (data.startsWith("view_saved_")) {
     const pid = Number(data.split("_")[2]);
     const row = await env.DB.prepare("SELECT nickname FROM saved_partners WHERE user_id = ? AND partner_id = ?").bind(userId, pid).first();
-    const nickname = row && row.nickname ? row.nickname : "Saved Partner";
-    const keyboard = { inline_keyboard: [[{ text: "Remove from Saved", callback_data: `remove_saved_${pid}` }]] };
-    return edit(`**Partner Details**\nNickname: \`${nickname}\`\n\nWhat would you like to do?`, { reply_markup: keyboard, parse_mode: "Markdown" });
+    if (!row) return edit("This partner is no longer in your saved list.");
+    const keyboard = {
+      inline_keyboard: [
+        [{ text: "🔗 Connect", callback_data: `sc_${pid}` }, { text: "✏️ Rename", callback_data: `sr_${pid}` }],
+        [{ text: "🗑 Remove", callback_data: `remove_saved_${pid}` }, { text: "🚫 Block", callback_data: `sb_${pid}` }],
+      ],
+    };
+    return edit(`**Saved Partner**\nName: ${row.nickname || "Saved Partner"}\n\nWhat would you like to do?`, { reply_markup: keyboard });
+  }
+
+  if (data.startsWith("sc_")) {
+    const pid = Number(data.split("_")[1]);
+    if (!(await isSaved(env, userId, pid))) return edit("This partner is no longer in your saved list.");
+    if (await getPartner(env, userId)) return edit("End your current chat first, then tap Connect.");
+    if ((await isBlocked(env, pid, userId)) || (await isBlocked(env, userId, pid))) return edit("The request could not be sent.");
+    if (await requestedToday(env, userId, pid)) return edit("You already sent a request to this partner today.");
+    const busy = !!(await getPartner(env, pid));
+    const r = await env.DB.prepare("INSERT INTO saved_requests (from_id, to_id, kind, ts, status) VALUES (?, ?, 'connect', ?, ?) RETURNING id").bind(userId, pid, nowSec(), busy ? "pending" : "shown").first();
+    if (!busy) await send(env, pid, "🔗 Your saved partner wants to chat with you. Accept?", { reply_markup: reqKb("cn", r.id) });
+    return edit("🔗 Request sent. They will see it and can accept or decline.");
+  }
+
+  if (data.startsWith("sr_")) {
+    const pid = Number(data.split("_")[1]);
+    await setState(env, userId, "rename", String(pid));
+    return edit("✏️ Send a new nickname (up to 20 characters). Send /cancel to stop.");
+  }
+
+  if (data.startsWith("sb_")) {
+    const pid = Number(data.split("_")[1]);
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM saved_partners WHERE (user_id = ? AND partner_id = ?) OR (user_id = ? AND partner_id = ?)").bind(userId, pid, pid, userId),
+      env.DB.prepare("INSERT OR IGNORE INTO blocks (user_id, blocked_id) VALUES (?, ?)").bind(userId, pid),
+    ]);
+    return edit("🚫 Blocked and removed. You will not be matched with this person again.");
   }
 
   if (data.startsWith("remove_saved_")) {
     const pid = Number(data.split("_")[2]);
     await env.DB.prepare("DELETE FROM saved_partners WHERE user_id = ? AND partner_id = ?").bind(userId, pid).run();
-    return edit("**Partner removed from your saved list.**", { parse_mode: "Markdown" });
+    return edit("🗑 Partner removed from your saved list.");
   }
 }
 
@@ -1378,6 +1907,9 @@ async function runCron(env) {
   await ensureSchema(env);
   await processBroadcast(env);
   await expireBans(env);
+  await expireRestrictions(env);
+  await sweepGames(env);
+  await sweepRequests(env);
   await runMatcher(env);
 }
 
@@ -1388,6 +1920,7 @@ export default {
     try {
       if (request.method === "POST" && env.BOT_TOKEN && url.pathname === `/webhook/${env.BOT_TOKEN}`) {
         const update = await request.json();
+        env.__wait = (p) => ctx.waitUntil(p.catch((e) => console.log("timer error", String(e))));
         // Telegram ko turant OK, kaam background mein
         ctx.waitUntil(handleUpdate(env, update).catch((e) => console.log("update error", (e && e.stack) || String(e))));
         return new Response("OK");
@@ -1399,6 +1932,18 @@ export default {
         await ensureSchema(env);
         const webhookUrl = `${url.origin}/webhook/${env.BOT_TOKEN}`;
         const r = await tg(env, "setWebhook", { url: webhookUrl, allowed_updates: ["message", "callback_query"] });
+        await tg(env, "setMyCommands", {
+          commands: [
+            { command: "search", description: "Find a partner" },
+            { command: "next", description: "Skip to a new partner" },
+            { command: "stop", description: "End the chat" },
+            { command: "play", description: "Play Tic-Tac-Toe" },
+            { command: "profile", description: "Your badge and progress" },
+            { command: "report", description: "Report your current partner" },
+            { command: "help", description: "Show commands" },
+            { command: "start", description: "Set up your profile" },
+          ],
+        });
         const admins = adminIds(env).length;
         return new Response(
           r.ok
