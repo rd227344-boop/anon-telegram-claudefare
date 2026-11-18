@@ -17,6 +17,7 @@ const DEFAULTS = {
   MIN_REPORT_TEXT: 25, // underage report / appeal mein kam se kam itne characters
 };
 const MAX_SAVED = 10; // ek user ke max saved partners
+const CODE_VERSION = "v5-hide-menu-big-game"; // worker URL kholne par dikhta hai, isse pata chalta hai nayi file live hui ya nahi
 const cfg = (env, key) => {
   const v = Number(env[key]);
   return Number.isFinite(v) && v > 0 ? v : DEFAULTS[key];
@@ -1986,7 +1987,7 @@ export default {
         );
       }
 
-      return new Response(`Bot is running via Webhook!\nBOT_TOKEN: ${env.BOT_TOKEN ? "ok" : "MISSING"}\nDB: ${env.DB ? "ok" : "MISSING"}`);
+      return new Response(`Bot is running via Webhook!\nBOT_TOKEN: ${env.BOT_TOKEN ? "ok" : "MISSING"}\nDB: ${env.DB ? "ok" : "MISSING"}\nVersion: ${CODE_VERSION}`);
     } catch (e) {
       console.log("fetch error", (e && e.stack) || String(e));
       return new Response("Error", { status: 500 });
