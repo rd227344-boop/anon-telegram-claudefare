@@ -43,14 +43,14 @@ const BTN_STOP = "⛔ Stop Chat";
 const BTN_SAVE = "💾 Save Partner";
 const BTN_SAVED = "📂 Saved Partners";
 const BTN_PLAY = "🎮 Play Game";
-const BUTTONS = [BTN_NEXT, BTN_STOP, BTN_SAVE, BTN_SAVED, BTN_PLAY];
+const BTN_HIDE = "🔽 Hide Menu";
+const BUTTONS = [BTN_NEXT, BTN_STOP, BTN_SAVE, BTN_SAVED, BTN_PLAY, BTN_HIDE];
 // purane keyboard wale users abhi purane labels bhejenge, unhe naye button maano
 const LEGACY_BTN = { "Next Partner": BTN_NEXT, "Stop Chat": BTN_STOP, "Save Partner": BTN_SAVE, "Saved Partners": BTN_SAVED };
 
 const MAIN_KEYBOARD = {
-  keyboard: [[{ text: BTN_NEXT }, { text: BTN_STOP }], [{ text: BTN_SAVE }, { text: BTN_SAVED }], [{ text: BTN_PLAY }]],
+  keyboard: [[{ text: BTN_NEXT }, { text: BTN_STOP }], [{ text: BTN_SAVE }, { text: BTN_SAVED }], [{ text: BTN_PLAY }, { text: BTN_HIDE }]],
   resize_keyboard: true,
-  is_persistent: true, // keyboard (Next / Stop...) hamesha dikhta rahe, chhupta nahi
 };
 
 const MATCH_MSG = "**Connected with a stranger.** Say hello!\nUse the buttons below to control the chat.";
@@ -140,7 +140,7 @@ async function ensureSchema(env) {
     created_at: "INTEGER", last_seen: "INTEGER", banned: "INTEGER DEFAULT 0", ban_reason: "TEXT",
     ban_until: "INTEGER", ban_count: "INTEGER DEFAULT 0", appeal_state: "INTEGER DEFAULT 0", report_floor: "INTEGER DEFAULT 0",
     likes: "INTEGER DEFAULT 0", dislikes: "INTEGER DEFAULT 0", badge_penalty: "INTEGER DEFAULT 0", streak: "INTEGER DEFAULT 0",
-    last_active_day: "TEXT", restrict_until: "INTEGER DEFAULT 0", spam_chats: "INTEGER DEFAULT 0", spam_offenses: "INTEGER DEFAULT 0",
+    last_active_day: "TEXT", restrict_until: "INTEGER DEFAULT 0", spam_chats: "INTEGER DEFAULT 0", spam_offenses: "INTEGER DEFAULT 0", menu_hidden: "INTEGER DEFAULT 0",
   });
   await addMissing("reports", { details: "TEXT", shot: "TEXT" });
   await addMissing("recent", { gap: "INTEGER DEFAULT 15" });
@@ -202,6 +202,13 @@ async function tg(env, method, payload) {
 }
 
 async function send(env, chatId, text, extra = {}) {
+  if (extra.reply_markup === MAIN_KEYBOARD) {
+    const hu = await env.DB.prepare("SELECT menu_hidden FROM users WHERE user_id = ?").bind(chatId).first();
+    if (hu && hu.menu_hidden) {
+      const { reply_markup, ...rest } = extra;
+      extra = rest;
+    }
+  }
   let r = await tg(env, "sendMessage", { chat_id: chatId, text, ...extra });
   if (!r.ok && extra.parse_mode && /parse entities/i.test(r.description || "")) {
     const { parse_mode, ...rest } = extra;
@@ -530,10 +537,13 @@ function boardKb(g, forUser) {
   if (g.status === "done") rows.push([{ text: "🔁 Rematch", callback_data: `g_re_${g.id}` }]);
   return { inline_keyboard: rows };
 }
+// Telegram buttons message ki chaudai ke barabar failte hain. Chhota text = chhota board.
+// Is liye text ke neeche ek khaali (invisible) lambi line jodte hain taaki board bada dikhe. Chhota/bada karna ho to 34 badlo.
+const GAME_PAD = "\u2800".repeat(34);
 function gameText(g, forUser, note) {
-  if (g.status === "done") return `🎮 Tic-Tac-Toe\n${note || "Game over."}`;
+  if (g.status === "done") return `🎮 Tic-Tac-Toe\n${note || "Game over."}\n${GAME_PAD}`;
   const you = g.xid === forUser ? "❌" : "⭕";
-  return `🎮 Tic-Tac-Toe\nYou are ${you}\n${g.turn === forUser ? `Your turn (${TURN_SECONDS}s)` : "Partner's turn"}`;
+  return `🎮 Tic-Tac-Toe\nYou are ${you}\n${g.turn === forUser ? `Your turn (${TURN_SECONDS}s)` : "Partner's turn"}\n${GAME_PAD}`;
 }
 async function renderGame(env, g, notes) {
   for (const [uid, mid] of [[g.p1, g.m1], [g.p2, g.m2]]) {
@@ -545,6 +555,15 @@ async function createInvite(env, a, b) {
   const t = nowSec();
   const r = await env.DB.prepare("INSERT INTO games (p1, p2, board, xid, turn, status, last_act, turn_ts) VALUES (?, ?, '---------', ?, ?, 'invite', ?, ?) RETURNING id").bind(a, b, a, a, t, t).first();
   return r.id;
+}
+
+async function hideMenu(env, userId, chatId) {
+  await env.DB.prepare("UPDATE users SET menu_hidden = 1 WHERE user_id = ?").bind(userId).run();
+  return send(env, chatId, "✅ Menu hidden. Use the Next / Stop buttons on the Connected message, or type /menu to show the menu again.", { reply_markup: { remove_keyboard: true } });
+}
+async function showMenu(env, userId, chatId) {
+  await env.DB.prepare("UPDATE users SET menu_hidden = 0 WHERE user_id = ?").bind(userId).run();
+  return send(env, chatId, "✅ Menu is back.", { reply_markup: { ...MAIN_KEYBOARD } });
 }
 
 async function handlePlay(env, userId, chatId) {
@@ -722,8 +741,9 @@ async function announceMatch(env, a, b, title) {
     const hello = me && badgeLevel(me) >= 1 ? `⭐ Welcome back, ${BADGES[badgeLevel(me)]} user!\n` : "";
     return `${hello}${head}\nPartner badge: ${badgeText(other)}\nUse the buttons below to control the chat.`;
   };
-  await send(env, a, msgFor(pa, pb), { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
-  await send(env, b, msgFor(pb, pa), { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
+  const chatKb = (pid) => ({ inline_keyboard: [[{ text: "⏭ Next", callback_data: `act_next_${pid}` }, { text: "⛔ Stop", callback_data: `act_stop_${pid}` }]] });
+  await send(env, a, msgFor(pa, pb), { reply_markup: chatKb(b), parse_mode: "Markdown" });
+  await send(env, b, msgFor(pb, pa), { reply_markup: chatKb(a), parse_mode: "Markdown" });
 }
 
 // Cron: queue mein atke hue log (gap khatam hone ke baad) ko jod deta hai
@@ -1377,6 +1397,8 @@ async function onCommand(env, msg) {
   if (cmd === "stop") return stopChat(env, user.id, chatId);
   if (cmd === "next") return nextPartner(env, user.id, chatId);
   if (cmd === "play") return handlePlay(env, user.id, chatId);
+  if (cmd === "menu") return showMenu(env, user.id, chatId);
+  if (cmd === "hidemenu") return hideMenu(env, user.id, chatId);
   if (cmd === "profile") {
     const p = await getProfile(env, user.id);
     if (!isComplete(p)) return send(env, chatId, "Please complete your profile first by typing /start");
@@ -1406,6 +1428,8 @@ async function onCommand(env, msg) {
       "/search - find a partner",
       "/next - skip to a new partner",
       "/play - play Tic-Tac-Toe with your partner",
+      "/menu - show the bottom menu buttons",
+      "/hidemenu - hide the bottom menu buttons",
       "/profile - see your badge and progress",
       "/stop - end the chat or stop searching",
       "/report - report your current partner and end the chat",
@@ -1503,6 +1527,7 @@ async function onMessage(env, msg) {
   if (text === BTN_SAVE) return onSavePressed(env, userId, chatId);
   if (text === BTN_SAVED) return showSaved(env, userId, chatId);
   if (text === BTN_PLAY) return handlePlay(env, userId, chatId);
+  if (text === BTN_HIDE) return hideMenu(env, userId, chatId);
 
   // Normal chat message
   const partnerId = await getPartner(env, userId);
@@ -1641,6 +1666,13 @@ async function onCallback(env, cq) {
       return edit("Broadcast cancelled.");
     }
     return;
+  }
+
+  if (data.startsWith("act_next_") || data.startsWith("act_stop_")) {
+    const pid = Number(data.split("_")[2]);
+    if ((await getPartner(env, userId)) !== pid) return answer("This chat has already ended.");
+    await answer();
+    return data.startsWith("act_next_") ? nextPartner(env, userId, chatId) : stopChat(env, userId, chatId);
   }
 
   if (data.startsWith("g_")) return onGameCallback(env, cq, userId, chatId, mid, edit, answer, data);
@@ -1938,6 +1970,7 @@ export default {
             { command: "next", description: "Skip to a new partner" },
             { command: "stop", description: "End the chat" },
             { command: "play", description: "Play Tic-Tac-Toe" },
+            { command: "menu", description: "Show or hide the bottom buttons" },
             { command: "profile", description: "Your badge and progress" },
             { command: "report", description: "Report your current partner" },
             { command: "help", description: "Show commands" },
