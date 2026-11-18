@@ -13,6 +13,8 @@ const DEFAULTS = {
   BROADCAST_CHUNK: 30, // ek baar mein itne users ko broadcast (free plan ki limit ke andar)
   AUTO_BAN_REPORTS: 5, // itne alag alag users report karein to auto ban
   MAX_PENDING_MEDIA: 10, // request ke intezaar mein ek category ke max items
+  WARN_AFTER_REPORTS: 3, // itne alag users ki report ke baad har nayi report par warning
+  MIN_REPORT_TEXT: 25, // underage report / appeal mein kam se kam itne characters
 };
 const cfg = (env, key) => {
   const v = Number(env[key]);
@@ -47,8 +49,10 @@ const MAIN_KEYBOARD = {
 };
 
 const MATCH_MSG = "**Connected with a stranger.** Say hello!\nUse the buttons below to control the chat.";
-const FEEDBACK_TEXT = "If you wish, leave feedback about your partner. It helps us keep the community safe.";
+const FEEDBACK_TEXT = "If you wish, report your partner. It helps us keep the community safe.";
 const REASONS = { sp: "Spam / Advertising", vg: "Vulgar partner", ua: "Underage user", rp: "Other report" };
+const BAN_LADDER_DAYS = [30, 365]; // 1st ban 30 din, 2nd 1 saal, 3rd se permanent
+const APPEAL_KB = { inline_keyboard: [[{ text: "Appeal", callback_data: "appeal_start" }]] };
 
 // ---------------------------------------------------------------- Schema
 
@@ -95,6 +99,10 @@ const SCHEMA = [
     status TEXT, total INTEGER DEFAULT 0, sent INTEGER DEFAULT 0, failed INTEGER DEFAULT 0,
     cursor INTEGER DEFAULT 0, lock_until INTEGER, created_at INTEGER, finished_at INTEGER
   )`,
+  `CREATE TABLE IF NOT EXISTS user_state (user_id INTEGER PRIMARY KEY, kind TEXT, data TEXT, ts INTEGER)`,
+  `CREATE TABLE IF NOT EXISTS appeals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, text TEXT, ts INTEGER, status TEXT
+  )`,
 ];
 
 let schemaReady = false;
@@ -108,7 +116,11 @@ async function ensureSchema(env) {
       if (!have.includes(name)) await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${name} ${def}`).run();
     }
   };
-  await addMissing("users", { created_at: "INTEGER", last_seen: "INTEGER", banned: "INTEGER DEFAULT 0", ban_reason: "TEXT" });
+  await addMissing("users", {
+    created_at: "INTEGER", last_seen: "INTEGER", banned: "INTEGER DEFAULT 0", ban_reason: "TEXT",
+    ban_until: "INTEGER", ban_count: "INTEGER DEFAULT 0", appeal_state: "INTEGER DEFAULT 0", report_floor: "INTEGER DEFAULT 0",
+  });
+  await addMissing("reports", { details: "TEXT", shot: "TEXT" });
   await addMissing("recent", { gap: "INTEGER DEFAULT 15" });
   await env.DB.batch([env.DB.prepare("DROP TABLE IF EXISTS consent"), env.DB.prepare("DROP TABLE IF EXISTS pending_media")]);
   schemaReady = true;
@@ -207,7 +219,7 @@ async function sendMedia(env, chatId, kind, fileId) {
 
 async function getProfile(env, id) {
   return await env.DB.prepare(
-    "SELECT gender, age, language, waiting_nick, banned, ban_reason, last_seen FROM users WHERE user_id = ?"
+    "SELECT gender, age, language, waiting_nick, banned, ban_reason, ban_until, ban_count, appeal_state, report_floor, last_seen FROM users WHERE user_id = ?"
   ).bind(id).first();
 }
 
@@ -219,6 +231,37 @@ async function setField(env, user, col, val) {
     .bind(user.id, user.username ?? null, nowSec())
     .run();
   await env.DB.prepare(`UPDATE users SET ${col} = ? WHERE user_id = ?`).bind(val, user.id).run();
+}
+
+// Chhoti baatcheet ka state (underage report likhna, appeal likhna). 15 minute mein expire.
+async function getState(env, id) {
+  const r = await env.DB.prepare("SELECT kind, data, ts FROM user_state WHERE user_id = ?").bind(id).first();
+  if (!r) return null;
+  if (nowSec() - r.ts > 900) {
+    await clearState(env, id);
+    return null;
+  }
+  return r;
+}
+async function setState(env, id, kind, data) {
+  await env.DB.prepare("INSERT OR REPLACE INTO user_state (user_id, kind, data, ts) VALUES (?, ?, ?, ?)").bind(id, kind, data || "", nowSec()).run();
+}
+async function clearState(env, id) {
+  await env.DB.prepare("DELETE FROM user_state WHERE user_id = ?").bind(id).run();
+}
+
+function timeLeft(sec) {
+  if (sec <= 60) return "less than a minute";
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d) return `${d} day${d > 1 ? "s" : ""} ${h} hour${h !== 1 ? "s" : ""}`;
+  if (h) return `${h} hour${h !== 1 ? "s" : ""} ${m} min`;
+  return `${m} min`;
+}
+
+async function hasRecentReport(env, reporter, reported) {
+  return !!(await env.DB.prepare("SELECT 1 AS x FROM reports WHERE reporter_id = ? AND reported_id = ? AND ts > ?").bind(reporter, reported, nowSec() - 86400).first());
 }
 
 async function getPartner(env, id) {
@@ -353,12 +396,7 @@ async function searchPartner(env, userId, chatId) {
 // ---------------------------------------------------------------- Stop / Next / Feedback
 
 function feedbackKeyboard(partnerId, withSearch) {
-  const rows = [
-    [{ text: "Spam / Advertising", callback_data: `fb_sp_${partnerId}` }],
-    [{ text: "Vulgar partner", callback_data: `fb_vg_${partnerId}` }],
-    [{ text: "Underage user", callback_data: `fb_ua_${partnerId}` }],
-    [{ text: "Report", callback_data: `fb_rp_${partnerId}` }],
-  ];
+  const rows = [[{ text: "⚠️ Report", callback_data: `rpt_${partnerId}` }]];
   if (withSearch) rows.push([{ text: "Search New Partner", callback_data: "action_search" }]);
   return { inline_keyboard: rows };
 }
@@ -399,41 +437,134 @@ async function nextPartner(env, userId, chatId) {
   return searchPartner(env, userId, chatId);
 }
 
+const banNotice = (until) =>
+  until ? `🚫 You have been banned from using this bot.\nTime left: ${timeLeft(until - nowSec())}` : "🚫 You have been banned from using this bot.\nThis ban is permanent.";
+
+// Ban ladder: 1st = 30 din, 2nd = 1 saal, 3rd = permanent. Return: { until, label }
 async function banUser(env, id, reason) {
-  await env.DB.prepare("UPDATE users SET banned = 1, ban_reason = ? WHERE user_id = ?").bind(reason, id).run();
+  const t = nowSec();
+  const u = await env.DB.prepare("SELECT ban_count FROM users WHERE user_id = ?").bind(id).first();
+  const n = ((u && u.ban_count) || 0) + 1;
+  const days = BAN_LADDER_DAYS[n - 1];
+  const until = days ? t + days * 86400 : null;
+  const label = days === 30 ? "30 days" : days === 365 ? "1 year" : "permanent";
+
+  // jinhone report kiya tha unhe baad mein batayenge
+  const reporters = (await env.DB.prepare("SELECT DISTINCT reporter_id FROM reports WHERE reported_id = ? AND ts > ?").bind(id, t - 30 * 86400).all()).results.slice(0, 10);
+
+  await env.DB.prepare("UPDATE users SET banned = 1, ban_reason = ?, ban_until = ?, ban_count = ?, appeal_state = 0, report_floor = ? WHERE user_id = ?")
+    .bind(reason, until, n, t, id)
+    .run();
   await env.DB.prepare("DELETE FROM queue WHERE user_id = ?").bind(id).run();
+  await clearState(env, id);
   const partnerId = await getPartner(env, id);
   if (partnerId) {
     await endChat(env, id, partnerId);
     await send(env, partnerId, "**Your partner stopped the chat.**\nType /search to find a new partner.", { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
   }
-  await send(env, id, "You have been banned from using this bot.");
+  await send(env, id, banNotice(until), { reply_markup: APPEAL_KB });
+  for (const r of reporters) {
+    if (r.reporter_id !== id) await send(env, r.reporter_id, "✅ Action was taken on a report you made. Thank you for keeping the community safe.");
+  }
+  return { until, label };
+}
+
+async function liftBan(env, id, message) {
+  await env.DB.prepare("UPDATE users SET banned = 0, ban_reason = NULL, ban_until = NULL, appeal_state = 0 WHERE user_id = ?").bind(id).run();
+  await clearState(env, id);
+  if (message) await send(env, id, message);
 }
 
 async function unbanUser(env, id) {
-  await env.DB.prepare("UPDATE users SET banned = 0, ban_reason = NULL WHERE user_id = ?").bind(id).run();
-  await send(env, id, "Your access to this bot has been restored. Type /start to continue.");
+  await liftBan(env, id, "Your access to this bot has been restored. Type /start to continue.");
+}
+
+// Jin users ka ban time khatam ho gaya unhe wapas laata hai (cron)
+async function expireBans(env) {
+  const { results } = await env.DB.prepare("SELECT user_id FROM users WHERE banned = 1 AND ban_until IS NOT NULL AND ban_until <= ? LIMIT 20").bind(nowSec()).all();
+  for (const r of results) {
+    await liftBan(env, r.user_id, "Your ban has ended and you can use the bot again. Please follow the rules to avoid another ban. Type /start to continue.");
+  }
 }
 
 // Report record karta hai. Return: "ok", "dup" ya "self"
-async function recordReport(env, reporter, reported, reason) {
+// Underage report ginti mein nahi aati, wo seedha owner ke paas jaati hai.
+async function recordReport(env, reporter, reported, reason, extra = {}) {
   if (reporter === reported) return "self";
   const t = nowSec();
-  const dup = await env.DB.prepare("SELECT 1 AS x FROM reports WHERE reporter_id = ? AND reported_id = ? AND ts > ?")
-    .bind(reporter, reported, t - 86400)
-    .first();
-  if (dup) return "dup";
-  await env.DB.prepare("INSERT INTO reports (reporter_id, reported_id, reason, ts) VALUES (?, ?, ?, ?)").bind(reporter, reported, reason, t).run();
+  if (await hasRecentReport(env, reporter, reported)) return "dup";
+  await env.DB.prepare("INSERT INTO reports (reporter_id, reported_id, reason, ts, details, shot) VALUES (?, ?, ?, ?, ?, ?)")
+    .bind(reporter, reported, reason, t, extra.details ?? null, extra.shot ?? null)
+    .run();
+  if (reason === REASONS.ua) return "ok";
 
-  const distinct = await count(env, "SELECT COUNT(DISTINCT reporter_id) FROM reports WHERE reported_id = ? AND ts > ?", reported, t - 7 * 86400);
   const target = await getProfile(env, reported);
-  if (target && !target.banned && distinct >= cfg(env, "AUTO_BAN_REPORTS") && !isAdmin(env, reported)) {
-    await banUser(env, reported, `Auto-ban: reported by ${distinct} users`);
+  if (!target || target.banned || isAdmin(env, reported)) return "ok";
+  const since = Math.max(t - 7 * 86400, target.report_floor || 0);
+  const distinct = await count(env, "SELECT COUNT(DISTINCT reporter_id) FROM reports WHERE reported_id = ? AND ts > ? AND reason != ?", reported, since, REASONS.ua);
+
+  if (distinct >= cfg(env, "AUTO_BAN_REPORTS")) {
+    const res = await banUser(env, reported, `Auto-ban: reported by ${distinct} users`);
     for (const a of adminIds(env)) {
-      await send(env, a, `<b>Auto-ban</b>\nUser <code>${reported}</code> was banned after reports from ${distinct} different users.\nOpen /user ${reported} to review or unban.`, { parse_mode: "HTML" });
+      await send(env, a, `<b>Auto-ban</b>\nUser <code>${reported}</code> was banned (${res.label}) after reports from ${distinct} different users.\nOpen /user ${reported} to review or unban.`, { parse_mode: "HTML" });
     }
+  } else if (distinct >= cfg(env, "WARN_AFTER_REPORTS")) {
+    await send(env, reported, `⚠️ Warning: a report was made against you (reason: ${reason}).\nPlease follow the community rules. Repeated reports can lead to a ban.`);
   }
   return "ok";
+}
+
+// Underage report: likha hua text (zaroori) + screenshot (optional), seedha owner ko
+async function finishUaReport(env, reporterId, d, shot) {
+  await clearState(env, reporterId);
+  const res = await recordReport(env, reporterId, d.target, REASONS.ua, { details: d.text, shot: shot ? shot[1] : null });
+  if (res !== "ok") {
+    return send(env, reporterId, "You have already reported this user today. Thank you.", { reply_markup: MAIN_KEYBOARD });
+  }
+  for (const a of adminIds(env)) {
+    await send(env, a, [
+      "<b>⚠️ Underage report</b>",
+      `Reported user: <code>${d.target}</code>`,
+      `Reporter: <code>${reporterId}</code>`,
+      "",
+      esc(d.text),
+    ].join("\n"), {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [
+        [{ text: "Ban user", callback_data: `adm_ban_${d.target}` }, { text: "Dismiss", callback_data: `adm_dis_${d.target}` }],
+        [{ text: "View user", callback_data: `adm_u_${d.target}` }],
+      ] },
+    });
+    if (shot) await sendMedia(env, a, shot[0], shot[1]);
+  }
+  return send(env, reporterId, "✅ Report received. Our team will review it. Thank you.", { reply_markup: MAIN_KEYBOARD });
+}
+
+const SKIP_KB = { inline_keyboard: [[{ text: "Skip", callback_data: "rpt_skip" }]] };
+
+async function handleUaReport(env, msg, st) {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  let d = {};
+  try { d = JSON.parse(st.data || "{}"); } catch (e) {}
+  if (!d.target) {
+    await clearState(env, userId);
+    return;
+  }
+  if (d.stage === "text") {
+    const text = (msg.text || "").trim();
+    const min = cfg(env, "MIN_REPORT_TEXT");
+    if (text.length < min) {
+      return send(env, chatId, `Please write a little more detail (at least ${min} characters, you wrote ${text.length}). Send /cancel to stop.`);
+    }
+    await setState(env, userId, "ua", JSON.stringify({ target: d.target, stage: "shot", text }));
+    return send(env, chatId, "Got it. If you have a screenshot as proof, send it now (optional).", { reply_markup: SKIP_KB });
+  }
+  let shot = null;
+  if (msg.photo && msg.photo.length) shot = ["photo", msg.photo[msg.photo.length - 1].file_id];
+  else if (msg.document && /^image\//.test(msg.document.mime_type || "")) shot = ["document", msg.document.file_id];
+  if (!shot) return send(env, chatId, "Please send a photo, or tap Skip.", { reply_markup: SKIP_KB });
+  return finishUaReport(env, userId, d, shot);
 }
 
 // ---------------------------------------------------------------- Admin panel
@@ -552,14 +683,14 @@ async function viewBanned(env) {
 }
 
 async function viewUserCard(env, id) {
-  const u = await env.DB.prepare("SELECT user_id, username, gender, age, language, created_at, last_seen, banned, ban_reason FROM users WHERE user_id = ?").bind(id).first();
+  const u = await env.DB.prepare("SELECT user_id, username, gender, age, language, created_at, last_seen, banned, ban_reason, ban_until, ban_count FROM users WHERE user_id = ?").bind(id).first();
   if (!u) return { text: `User <code>${id}</code> not found.`, kb: adminKb([[{ text: "Back", callback_data: "adm_users" }]]) };
   const partner = await getPartner(env, id);
   const queued = await inQueue(env, id);
   const reps = await env.DB.prepare("SELECT COUNT(*) AS c, COUNT(DISTINCT reporter_id) AS d FROM reports WHERE reported_id = ?").bind(id).first();
   const saved = await count(env, "SELECT COUNT(*) FROM saved_partners WHERE user_id = ?", id);
   let status = "Idle";
-  if (u.banned) status = `Banned${u.ban_reason ? " (" + esc(u.ban_reason) + ")" : ""}`;
+  if (u.banned) status = `Banned${u.ban_reason ? " (" + esc(u.ban_reason) + ")" : ""}${u.ban_until ? " until " + fmt(u.ban_until) : ", permanent"}`;
   else if (partner) status = "In a chat";
   else if (queued) status = "Searching";
   const text = [
@@ -573,6 +704,7 @@ async function viewUserCard(env, id) {
     `Status: ${status}`,
     `Reports against: ${reps.c} (from ${reps.d} users)`,
     `Saved partners: ${saved}`,
+    `Bans so far: ${u.ban_count || 0}`,
   ].join("\n");
   const action = u.banned ? { text: "Unban user", callback_data: `adm_unban_${id}` } : { text: "Ban user", callback_data: `adm_ban_${id}` };
   return { text, kb: adminKb([[action], [{ text: "Refresh", callback_data: `adm_u_${id}` }, { text: "Back", callback_data: "adm_users" }]]) };
@@ -639,7 +771,9 @@ async function viewSettings(env) {
     "  When disabled, only text can be sent in chats.",
     "",
     `Match gap: ${cfg(env, "GAP_MIN_SECONDS")} to ${cfg(env, "GAP_MAX_SECONDS")} seconds`,
+    `Warning after: ${cfg(env, "WARN_AFTER_REPORTS")} different reporters`,
     `Auto-ban after: ${cfg(env, "AUTO_BAN_REPORTS")} different reporters`,
+    "Ban ladder: 30 days, then 1 year, then permanent.",
     "",
     "Gap and auto-ban values are changed from Worker variables.",
   ].join("\n");
@@ -734,12 +868,53 @@ async function processBroadcast(env) {
 
 // ---------------------------------------------------------------- Gate (ban / maintenance)
 
+// Banned user: sirf ban ka message aur appeal ka option dikhta hai
+async function handleBanned(env, user, chatId, profile, input) {
+  const min = cfg(env, "MIN_REPORT_TEXT");
+  if (input.data === "appeal_start") {
+    if (profile.appeal_state === 1) return send(env, chatId, "Your appeal is already with our team. Please wait for a reply.");
+    if (profile.appeal_state === 2) return send(env, chatId, "Your appeal for this ban has already been reviewed.");
+    await setState(env, user.id, "appeal", "");
+    return send(env, chatId, `Please write your appeal in a few lines (at least ${min} characters). Tell us what happened.`);
+  }
+  const st = await getState(env, user.id);
+  if (input.text && !input.text.startsWith("/") && st && st.kind === "appeal" && profile.appeal_state === 0) {
+    const text = input.text.trim();
+    if (text.length < min) {
+      return send(env, chatId, `Please write a little more (at least ${min} characters, you wrote ${text.length}).`);
+    }
+    await env.DB.prepare("INSERT INTO appeals (user_id, text, ts, status) VALUES (?, ?, ?, 'open')").bind(user.id, text, nowSec()).run();
+    await env.DB.prepare("UPDATE users SET appeal_state = 1 WHERE user_id = ?").bind(user.id).run();
+    await clearState(env, user.id);
+    for (const a of adminIds(env)) {
+      await send(env, a, [
+        "<b>Ban appeal</b>",
+        `User: <code>${user.id}</code>`,
+        `Ban: ${profile.ban_until ? "until " + fmt(profile.ban_until) : "permanent"} (ban no. ${profile.ban_count || 1})`,
+        `Reason: ${esc(profile.ban_reason || "-")}`,
+        "",
+        esc(text),
+      ].join("\n"), {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "Unban", callback_data: `adm_apok_${user.id}` }, { text: "Reject", callback_data: `adm_apno_${user.id}` }], [{ text: "View user", callback_data: `adm_u_${user.id}` }]] },
+      });
+    }
+    return send(env, chatId, "Your appeal has been sent. We will review it.");
+  }
+  return send(env, chatId, banNotice(profile.ban_until), profile.appeal_state === 0 ? { reply_markup: APPEAL_KB } : {});
+}
+
 // true agar user aage badh sakta hai
-async function gate(env, user, chatId, profile) {
+async function gate(env, user, chatId, profile, input = {}) {
   const admin = isAdmin(env, user.id);
   if (profile && profile.banned && !admin) {
-    await send(env, chatId, "You have been banned from using this bot.");
-    return false;
+    if (profile.ban_until && profile.ban_until <= nowSec()) {
+      await liftBan(env, user.id, "Your ban has ended and you can use the bot again. Please follow the rules to avoid another ban.");
+      profile.banned = 0;
+    } else {
+      await handleBanned(env, user, chatId, profile, input);
+      return false;
+    }
   }
   const s = await getSettings(env);
   if (s.maintenance === "1" && !admin) {
@@ -786,7 +961,10 @@ async function onCommand(env, msg) {
 
   if (cmd === "search") return searchPartner(env, user.id, chatId);
   if (cmd === "stop") return stopChat(env, user.id, chatId);
-  if (cmd === "cancel") return send(env, chatId, "Setup cancelled.", { reply_markup: MAIN_KEYBOARD });
+  if (cmd === "cancel") {
+    await clearState(env, user.id);
+    return send(env, chatId, "Cancelled.", { reply_markup: MAIN_KEYBOARD });
+  }
   if (cmd === "myid") return send(env, chatId, `Your Telegram ID: <code>${user.id}</code>`, { parse_mode: "HTML" });
 
   if (cmd === "help") {
@@ -806,7 +984,7 @@ async function onCommand(env, msg) {
     const partnerId = await getPartner(env, user.id);
     if (!partnerId) return send(env, chatId, "You are not in an active chat.", { reply_markup: MAIN_KEYBOARD });
     await recordReport(env, user.id, partnerId, REASONS.rp);
-    await send(env, chatId, "Thank you. Your report has been recorded.");
+    await send(env, chatId, "✅ Report received. Our team will look into it. Thank you.");
     return stopChat(env, user.id, chatId);
   }
 
@@ -826,8 +1004,8 @@ async function onCommand(env, msg) {
     const id = Number(mm[1]);
     if (isAdmin(env, id)) return send(env, chatId, "You cannot ban an admin.");
     if (!(await getProfile(env, id))) return send(env, chatId, "User not found.");
-    await banUser(env, id, mm[2].trim() || "Banned by admin");
-    return send(env, chatId, `User ${id} has been banned.`);
+    const res = await banUser(env, id, mm[2].trim() || "Banned by admin");
+    return send(env, chatId, `User ${id} has been banned (${res.label}).`);
   }
 
   if (cmd === "unban") {
@@ -863,9 +1041,16 @@ async function onMessage(env, msg) {
   const text = msg.text;
 
   const profile = await getProfile(env, userId);
-  if (!(await gate(env, msg.from, chatId, profile))) return;
+  if (!(await gate(env, msg.from, chatId, profile, { text }))) return;
 
   if (text && text.startsWith("/")) return onCommand(env, msg);
+
+  // Underage report likhne ka intezaar (text zaroori, screenshot optional)
+  const st = await getState(env, userId);
+  if (st && st.kind === "ua") {
+    if (text && BUTTONS.includes(text)) await clearState(env, userId);
+    else return handleUaReport(env, msg, st);
+  }
 
   // Nickname ka intezaar
   if (profile && profile.waiting_nick && text && !BUTTONS.includes(text)) {
@@ -968,7 +1153,7 @@ async function onCallback(env, cq) {
   const answer = (text, alert) => tg(env, "answerCallbackQuery", { callback_query_id: cq.id, ...(text ? { text, show_alert: !!alert } : {}) });
 
   const profile = await getProfile(env, userId);
-  if (!(await gate(env, user, chatId, profile))) {
+  if (!(await gate(env, user, chatId, profile, { data }))) {
     return answer();
   }
 
@@ -1009,6 +1194,19 @@ async function onCallback(env, cq) {
       if (await getProfile(env, id)) await unbanUser(env, id);
       return editView(env, chatId, mid, await viewUserCard(env, id));
     }
+
+    if (data.startsWith("adm_apok_")) {
+      if (await getProfile(env, id)) await unbanUser(env, id);
+      await env.DB.prepare("UPDATE appeals SET status = 'approved' WHERE user_id = ? AND status = 'open'").bind(id).run();
+      return edit(`Appeal approved. User ${id} has been unbanned.`);
+    }
+    if (data.startsWith("adm_apno_")) {
+      await env.DB.prepare("UPDATE users SET appeal_state = 2 WHERE user_id = ?").bind(id).run();
+      await env.DB.prepare("UPDATE appeals SET status = 'rejected' WHERE user_id = ? AND status = 'open'").bind(id).run();
+      await send(env, id, "Your appeal was reviewed. The ban stays in place.");
+      return edit(`Appeal rejected for user ${id}.`);
+    }
+    if (data.startsWith("adm_dis_")) return edit(`Report dismissed for user ${id}.`);
 
     if (data.startsWith("adm_bcstop_")) {
       await env.DB.prepare("UPDATE broadcasts SET status = 'cancelled', finished_at = ? WHERE id = ? AND status = 'running'").bind(nowSec(), id).run();
@@ -1073,16 +1271,47 @@ async function onCallback(env, cq) {
     return searchPartner(env, userId, chatId);
   }
 
-  // ---- feedback / report
+  // ---- report: pehle sirf ek "Report" button, dabane par reasons
+  if (data === "rpt_skip") {
+    const st = await getState(env, userId);
+    let d = {};
+    try { d = JSON.parse((st && st.data) || "{}"); } catch (e) {}
+    if (!st || st.kind !== "ua" || d.stage !== "shot") return edit("This report is no longer active.");
+    await edit("Sending your report...");
+    return finishUaReport(env, userId, d, null);
+  }
+
+  if (data.startsWith("rpt_") || data.startsWith("rptb_")) {
+    const pid = Number(data.split("_")[1]);
+    if (!pid || !mid) return;
+    const keep = ((msg.reply_markup && msg.reply_markup.inline_keyboard) || []).filter((r) => r.some((b) => b.callback_data === "action_search"));
+    const rows = data.startsWith("rptb_")
+      ? [[{ text: "⚠️ Report", callback_data: `rpt_${pid}` }]]
+      : [
+          [{ text: REASONS.ua, callback_data: `fb_ua_${pid}` }],
+          [{ text: REASONS.vg, callback_data: `fb_vg_${pid}` }],
+          [{ text: REASONS.sp, callback_data: `fb_sp_${pid}` }],
+          [{ text: REASONS.rp, callback_data: `fb_rp_${pid}` }],
+          [{ text: "Back", callback_data: `rptb_${pid}` }],
+        ];
+    return tg(env, "editMessageReplyMarkup", { chat_id: chatId, message_id: mid, reply_markup: { inline_keyboard: [...rows, ...keep] } });
+  }
+
+  // ---- report reason chosen
   if (data.startsWith("fb_")) {
     const [, code, pid] = data.split("_");
     const reported = Number(pid);
     const reason = REASONS[code];
-    if (!reason || !reported) return;
+    if (!reason || !reported || reported === userId) return;
+    if (await hasRecentReport(env, userId, reported)) return edit("You have already reported this user today. Thank you.");
+    if (code === "ua") {
+      await setState(env, userId, "ua", JSON.stringify({ target: reported, stage: "text" }));
+      return edit(`Underage report\nPlease describe what happened (at least ${cfg(env, "MIN_REPORT_TEXT")} characters).\nSend /cancel to stop.`);
+    }
     const res = await recordReport(env, userId, reported, reason);
-    if (res === "dup") return edit("You have already reported this user. Thank you.");
+    if (res === "dup") return edit("You have already reported this user today. Thank you.");
     if (res === "self") return;
-    return edit("Thank you. Your feedback has been recorded.");
+    return edit("✅ Report received. Our team will look into it. Thank you.");
   }
 
   // ---- media requests (photo / sticker / video / file, har ek ki alag request)
@@ -1148,6 +1377,7 @@ async function handleUpdate(env, update) {
 async function runCron(env) {
   await ensureSchema(env);
   await processBroadcast(env);
+  await expireBans(env);
   await runMatcher(env);
 }
 
