@@ -17,7 +17,7 @@ const DEFAULTS = {
   MIN_REPORT_TEXT: 25, // underage report / appeal mein kam se kam itne characters
 };
 const MAX_SAVED = 10; // ek user ke max saved partners
-const CODE_VERSION = "v5-hide-menu-big-game"; // worker URL kholne par dikhta hai, isse pata chalta hai nayi file live hui ya nahi
+const CODE_VERSION = "v6-smart-menu-feedback"; // worker URL kholne par dikhta hai, isse pata chalta hai nayi file live hui ya nahi
 const cfg = (env, key) => {
   const v = Number(env[key]);
   return Number.isFinite(v) && v > 0 ? v : DEFAULTS[key];
@@ -45,14 +45,19 @@ const BTN_SAVE = "💾 Save Partner";
 const BTN_SAVED = "📂 Saved Partners";
 const BTN_PLAY = "🎮 Play Game";
 const BTN_HIDE = "🔽 Hide Menu";
-const BUTTONS = [BTN_NEXT, BTN_STOP, BTN_SAVE, BTN_SAVED, BTN_PLAY, BTN_HIDE];
+const BTN_SEARCH = "🔍 Find Partner";
+const BTN_PROFILE = "👤 My Profile";
+const BTN_FEEDBACK = "💬 Feedback";
+const BUTTONS = [BTN_NEXT, BTN_STOP, BTN_SAVE, BTN_SAVED, BTN_PLAY, BTN_HIDE, BTN_SEARCH, BTN_PROFILE, BTN_FEEDBACK];
 // purane keyboard wale users abhi purane labels bhejenge, unhe naye button maano
 const LEGACY_BTN = { "Next Partner": BTN_NEXT, "Stop Chat": BTN_STOP, "Save Partner": BTN_SAVE, "Saved Partners": BTN_SAVED };
 
-const MAIN_KEYBOARD = {
-  keyboard: [[{ text: BTN_NEXT }, { text: BTN_STOP }], [{ text: BTN_SAVE }, { text: BTN_SAVED }], [{ text: BTN_PLAY }, { text: BTN_HIDE }]],
-  resize_keyboard: true,
-};
+// Teen keyboard: chat ke andar sirf kaam ke buttons, search me sirf Stop, chat ke bahar poora menu
+const CHAT_KEYBOARD = { keyboard: [[{ text: BTN_NEXT }, { text: BTN_STOP }], [{ text: BTN_SAVE }, { text: BTN_PLAY }]], resize_keyboard: true, is_persistent: true };
+const SEARCH_KEYBOARD = { keyboard: [[{ text: BTN_STOP }]], resize_keyboard: true, is_persistent: true };
+const IDLE_KEYBOARD = { keyboard: [[{ text: BTN_SEARCH }, { text: BTN_SAVED }], [{ text: BTN_PROFILE }, { text: BTN_FEEDBACK }], [{ text: BTN_HIDE }]], resize_keyboard: true };
+// Code me jahan MAIN_KEYBOARD likha hai, send() user ki halat dekhkar sahi keyboard khud chun leta hai
+const MAIN_KEYBOARD = { keyboard: IDLE_KEYBOARD.keyboard, resize_keyboard: true };
 
 const MATCH_MSG = "**Connected with a stranger.** Say hello!\nUse the buttons below to control the chat.";
 const FEEDBACK_TEXT = "If you wish, report your partner. It helps us keep the community safe.";
@@ -113,6 +118,7 @@ const SCHEMA = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_sr_to ON saved_requests (to_id, status)`,
   `CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, text TEXT, ts INTEGER)`,
+  `CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, kind TEXT, text TEXT, ts INTEGER, status TEXT DEFAULT 'new')`,
   `CREATE TABLE IF NOT EXISTS games (
     id INTEGER PRIMARY KEY AUTOINCREMENT, p1 INTEGER, p2 INTEGER, board TEXT, xid INTEGER, turn INTEGER, status TEXT,
     m1 INTEGER, m2 INTEGER, last_act INTEGER, turn_ts INTEGER, miss1 INTEGER DEFAULT 0, miss2 INTEGER DEFAULT 0
@@ -204,8 +210,9 @@ async function tg(env, method, payload) {
 
 async function send(env, chatId, text, extra = {}) {
   if (extra.reply_markup === MAIN_KEYBOARD) {
-    const hu = await env.DB.prepare("SELECT menu_hidden FROM users WHERE user_id = ?").bind(chatId).first();
-    if (hu && hu.menu_hidden) {
+    const kb = await pickKeyboard(env, chatId);
+    if (kb) extra = { ...extra, reply_markup: kb };
+    else {
       const { reply_markup, ...rest } = extra;
       extra = rest;
     }
@@ -217,6 +224,15 @@ async function send(env, chatId, text, extra = {}) {
   }
   if (!r.ok) console.log("sendMessage failed", chatId, r.description);
   return r;
+}
+
+// User ki halat ke hisaab se keyboard: chat me / search me / khaali. Menu hide kiya ho to null.
+async function pickKeyboard(env, uid, ignoreHidden) {
+  const u = await env.DB.prepare("SELECT menu_hidden FROM users WHERE user_id = ?").bind(uid).first();
+  if (!ignoreHidden && u && u.menu_hidden) return null;
+  if (await env.DB.prepare("SELECT 1 AS x FROM chats WHERE user_id = ?").bind(uid).first()) return CHAT_KEYBOARD;
+  if (await env.DB.prepare("SELECT 1 AS x FROM queue WHERE user_id = ?").bind(uid).first()) return SEARCH_KEYBOARD;
+  return IDLE_KEYBOARD;
 }
 
 async function editText(env, chatId, messageId, text, extra = {}) {
@@ -249,7 +265,7 @@ async function sendMedia(env, chatId, kind, fileId) {
 
 async function getProfile(env, id) {
   return await env.DB.prepare(
-    "SELECT gender, age, language, waiting_nick, banned, ban_reason, ban_until, ban_count, appeal_state, report_floor, last_seen, likes, dislikes, badge_penalty, streak, last_active_day, restrict_until, spam_chats, spam_offenses FROM users WHERE user_id = ?"
+    "SELECT gender, age, language, waiting_nick, banned, ban_reason, ban_until, ban_count, appeal_state, report_floor, last_seen, likes, dislikes, badge_penalty, streak, last_active_day, restrict_until, spam_chats, spam_offenses, menu_hidden FROM users WHERE user_id = ?"
   ).bind(id).first();
 }
 
@@ -564,7 +580,7 @@ async function hideMenu(env, userId, chatId) {
 }
 async function showMenu(env, userId, chatId) {
   await env.DB.prepare("UPDATE users SET menu_hidden = 0 WHERE user_id = ?").bind(userId).run();
-  return send(env, chatId, "✅ Menu is back.", { reply_markup: { ...MAIN_KEYBOARD } });
+  return send(env, chatId, "✅ Menu is back.", { reply_markup: await pickKeyboard(env, userId, true) });
 }
 
 async function handlePlay(env, userId, chatId) {
@@ -743,8 +759,9 @@ async function announceMatch(env, a, b, title) {
     return `${hello}${head}\nPartner badge: ${badgeText(other)}\nUse the buttons below to control the chat.`;
   };
   const chatKb = (pid) => ({ inline_keyboard: [[{ text: "⏭ Next", callback_data: `act_next_${pid}` }, { text: "⛔ Stop", callback_data: `act_stop_${pid}` }]] });
-  await send(env, a, msgFor(pa, pb), { reply_markup: chatKb(b), parse_mode: "Markdown" });
-  await send(env, b, msgFor(pb, pa), { reply_markup: chatKb(a), parse_mode: "Markdown" });
+  const kbFor = (me, pid) => (me && me.menu_hidden ? chatKb(pid) : MAIN_KEYBOARD); // menu hide hai to inline Next/Stop
+  await send(env, a, msgFor(pa, pb), { reply_markup: kbFor(pa, b), parse_mode: "Markdown" });
+  await send(env, b, msgFor(pb, pa), { reply_markup: kbFor(pb, a), parse_mode: "Markdown" });
 }
 
 // Cron: queue mein atke hue log (gap khatam hone ke baad) ko jod deta hai
@@ -779,7 +796,7 @@ async function searchPartner(env, userId, chatId) {
   }
   if (!(await inQueue(env, userId))) return; // kisi aur ne humein match kar diya, wahi message bhej dega
 
-  await reply("🔍 **Searching for a partner...** Please wait.", { parse_mode: "Markdown" });
+  await reply("🔍 **Searching for a partner...** Please wait.", { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD });
 
   // 1-2 second same language ka intezaar, phir kisi se bhi
   await sleep(env, 1500);
@@ -987,6 +1004,74 @@ async function handleUaReport(env, msg, st) {
   return finishUaReport(env, userId, d, shot);
 }
 
+// ---------------------------------------------------------------- Feedback
+
+const FB_KINDS = { bug: "Bug", idea: "Idea", complaint: "Complaint", other: "Other" };
+const FB_PER_DAY = 3;
+
+async function startFeedback(env, userId, chatId) {
+  const n = await count(env, "SELECT COUNT(*) FROM feedback WHERE user_id = ? AND ts > ?", userId, nowSec() - 86400);
+  if (n >= FB_PER_DAY) return send(env, chatId, "You have sent enough feedback for today. Please try again tomorrow. Thank you!", { reply_markup: MAIN_KEYBOARD });
+  return send(env, chatId, "💬 What kind of feedback would you like to share?", {
+    reply_markup: { inline_keyboard: [
+      [{ text: "🐞 Bug", callback_data: "fbk_bug" }, { text: "💡 Idea", callback_data: "fbk_idea" }],
+      [{ text: "😕 Complaint", callback_data: "fbk_complaint" }, { text: "📝 Other", callback_data: "fbk_other" }],
+    ] },
+  });
+}
+
+async function handleFeedbackText(env, msg, st) {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const text = (msg.text || "").trim();
+  if (text.length < 10) return send(env, chatId, `Please write a little more (at least 10 characters, you wrote ${text.length}). Send /cancel to stop.`);
+  if (hasLink(msg)) return send(env, chatId, "Links are not allowed in feedback. Please describe it in words.");
+  const n = await count(env, "SELECT COUNT(*) FROM feedback WHERE user_id = ? AND ts > ?", userId, nowSec() - 86400);
+  if (n >= FB_PER_DAY) {
+    await clearState(env, userId);
+    return send(env, chatId, "You have sent enough feedback for today. Please try again tomorrow.", { reply_markup: MAIN_KEYBOARD });
+  }
+  const kind = FB_KINDS[st.data] || "Other";
+  const r = await env.DB.prepare("INSERT INTO feedback (user_id, kind, text, ts, status) VALUES (?, ?, ?, ?, 'new') RETURNING id").bind(userId, kind, text.slice(0, 1000), nowSec()).first();
+  await clearState(env, userId);
+  for (const a of adminIds(env)) {
+    await send(env, a, `<b>💬 Feedback #${r.id}</b> (${kind})\nFrom: <code>${userId}</code>\n\n${esc(text.slice(0, 1000))}`, {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [[{ text: "Reply", callback_data: `adm_fr_${r.id}` }]] },
+    });
+  }
+  return send(env, chatId, "✅ Thank you! Your feedback was sent to the Nexus team.", { reply_markup: MAIN_KEYBOARD });
+}
+
+async function handleFeedbackReply(env, msg, st) {
+  const adminId = msg.from.id;
+  const id = Number(st.data);
+  const fb = await env.DB.prepare("SELECT user_id FROM feedback WHERE id = ?").bind(id).first();
+  await clearState(env, adminId);
+  if (!fb) return send(env, msg.chat.id, "Feedback not found.");
+  const text = (msg.text || "").trim().slice(0, 1500);
+  await notify(env, fb.user_id, `📩 Reply from the Nexus team:\n\n${text}`); // chat me ho to chat ke baad milega
+  await env.DB.prepare("UPDATE feedback SET status = 'replied' WHERE id = ?").bind(id).run();
+  return send(env, msg.chat.id, `✅ Reply sent for feedback #${id}.`);
+}
+
+async function viewFeedback(env) {
+  const total = await count(env, "SELECT COUNT(*) FROM feedback");
+  const fresh = await count(env, "SELECT COUNT(*) FROM feedback WHERE status = 'new'");
+  const { results } = await env.DB.prepare("SELECT id, kind, user_id, text, status FROM feedback ORDER BY id DESC LIMIT 8").all();
+  const lines = [];
+  for (const r of results) {
+    lines.push(`#${r.id} [${esc(r.kind)}] ${r.status === "new" ? "NEW" : esc(r.status)} - <code>${r.user_id}</code>`);
+    lines.push(esc((r.text || "").slice(0, 90)));
+    lines.push("");
+  }
+  const kb = results.slice(0, 6).map((r) => [{ text: `Reply to #${r.id}`, callback_data: `adm_fr_${r.id}` }]);
+  return {
+    text: ["<b>Feedback</b>", `Total: ${total}   New: ${fresh}`, "", ...(lines.length ? lines : ["No feedback yet."])].join("\n"),
+    kb: adminKb([...kb, backRow]),
+  };
+}
+
 // ---------------------------------------------------------------- Admin panel
 
 const adminKb = (rows) => ({ inline_keyboard: rows });
@@ -1013,8 +1098,8 @@ async function viewHome(env) {
     kb: adminKb([
       [{ text: "Dashboard", callback_data: "adm_dash" }, { text: "Users", callback_data: "adm_users" }],
       [{ text: "Reports", callback_data: "adm_reports" }, { text: "Broadcast", callback_data: "adm_bc" }],
-      [{ text: "Settings", callback_data: "adm_set" }, { text: "Refresh", callback_data: "adm_home" }],
-      [{ text: "Close", callback_data: "adm_close" }],
+      [{ text: "Feedback", callback_data: "adm_fb" }, { text: "Settings", callback_data: "adm_set" }],
+      [{ text: "Refresh", callback_data: "adm_home" }, { text: "Close", callback_data: "adm_close" }],
     ]),
   };
 }
@@ -1399,6 +1484,11 @@ async function onCommand(env, msg) {
   if (cmd === "next") return nextPartner(env, user.id, chatId);
   if (cmd === "play") return handlePlay(env, user.id, chatId);
   if (cmd === "menu") return showMenu(env, user.id, chatId);
+  if (cmd === "feedback") return startFeedback(env, user.id, chatId);
+  if (cmd === "feedbacks" && isAdmin(env, user.id)) {
+    const v = await viewFeedback(env);
+    return send(env, chatId, v.text, { parse_mode: "HTML", reply_markup: v.kb });
+  }
   if (cmd === "hidemenu") return hideMenu(env, user.id, chatId);
   if (cmd === "profile") {
     const p = await getProfile(env, user.id);
@@ -1430,6 +1520,7 @@ async function onCommand(env, msg) {
       "/next - skip to a new partner",
       "/play - play Tic-Tac-Toe with your partner",
       "/menu - show the bottom menu buttons",
+      "/feedback - send feedback to the team",
       "/hidemenu - hide the bottom menu buttons",
       "/profile - see your badge and progress",
       "/stop - end the chat or stop searching",
@@ -1521,6 +1612,14 @@ async function onMessage(env, msg) {
       return send(env, chatId, `✅ Renamed to ${nick}.`, { reply_markup: MAIN_KEYBOARD });
     }
   }
+  if (st && st.kind === "fbk") {
+    if (!text || BUTTONS.includes(text)) await clearState(env, userId);
+    else return handleFeedbackText(env, msg, st);
+  }
+  if (st && st.kind === "fbr" && isAdmin(env, userId)) {
+    if (!text || BUTTONS.includes(text)) await clearState(env, userId);
+    else return handleFeedbackReply(env, msg, st);
+  }
 
   if (text === BTN_NEXT) return nextPartner(env, userId, chatId);
   if (text === BTN_STOP) return stopChat(env, userId, chatId);
@@ -1529,6 +1628,9 @@ async function onMessage(env, msg) {
   if (text === BTN_SAVED) return showSaved(env, userId, chatId);
   if (text === BTN_PLAY) return handlePlay(env, userId, chatId);
   if (text === BTN_HIDE) return hideMenu(env, userId, chatId);
+  if (text === BTN_SEARCH) return searchPartner(env, userId, chatId);
+  if (text === BTN_PROFILE) return onCommand(env, { ...msg, text: "/profile" });
+  if (text === BTN_FEEDBACK) return startFeedback(env, userId, chatId);
 
   // Normal chat message
   const partnerId = await getPartner(env, userId);
@@ -1613,6 +1715,13 @@ async function onCallback(env, cq) {
     if (data === "adm_reports") return editView(env, chatId, mid, await viewReports(env));
     if (data === "adm_bc") return editView(env, chatId, mid, await viewBroadcast(env));
     if (data === "adm_set") return editView(env, chatId, mid, await viewSettings(env));
+    if (data === "adm_fb") return editView(env, chatId, mid, await viewFeedback(env));
+    if (data.startsWith("adm_fr_")) {
+      const fb = await env.DB.prepare("SELECT id FROM feedback WHERE id = ?").bind(id).first();
+      if (!fb) return send(env, chatId, "Feedback not found.");
+      await setState(env, userId, "fbr", String(id));
+      return send(env, chatId, `Send your reply for feedback #${id} now (one message). /cancel to stop.`);
+    }
 
     if (data === "adm_tog_maint") {
       const s = await getSettings(env);
@@ -1720,6 +1829,14 @@ async function onCallback(env, cq) {
       await tg(env, "editMessageReplyMarkup", { chat_id: chatId, message_id: mid, reply_markup: { inline_keyboard: kb } });
     }
     return searchPartner(env, userId, chatId);
+  }
+
+  // ---- feedback type chuna
+  if (data.startsWith("fbk_")) {
+    const k = data.split("_")[1];
+    if (!FB_KINDS[k]) return;
+    await setState(env, userId, "fbk", k);
+    return edit(`Write your ${FB_KINDS[k]} feedback in one message (at least 10 characters).\nIt goes to the Nexus team with your user ID, never to your chat partner.\nSend /cancel to stop.`);
   }
 
   // ---- like / dislike (report se bilkul alag)
@@ -1972,6 +2089,7 @@ export default {
             { command: "stop", description: "End the chat" },
             { command: "play", description: "Play Tic-Tac-Toe" },
             { command: "menu", description: "Show or hide the bottom buttons" },
+            { command: "feedback", description: "Send feedback to the team" },
             { command: "profile", description: "Your badge and progress" },
             { command: "report", description: "Report your current partner" },
             { command: "help", description: "Show commands" },
