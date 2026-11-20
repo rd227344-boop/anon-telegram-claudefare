@@ -17,7 +17,7 @@ const DEFAULTS = {
   MIN_REPORT_TEXT: 25, // underage report / appeal mein kam se kam itne characters
 };
 const MAX_SAVED = 10; // ek user ke max saved partners
-const CODE_VERSION = "v6-smart-menu-feedback"; // worker URL kholne par dikhta hai, isse pata chalta hai nayi file live hui ya nahi
+const CODE_VERSION = "v7-warn-notice"; // worker URL kholne par dikhta hai, isse pata chalta hai nayi file live hui ya nahi
 const cfg = (env, key) => {
   const v = Number(env[key]);
   return Number.isFinite(v) && v > 0 ? v : DEFAULTS[key];
@@ -118,6 +118,7 @@ const SCHEMA = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_sr_to ON saved_requests (to_id, status)`,
   `CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, text TEXT, ts INTEGER)`,
+  `CREATE TABLE IF NOT EXISTS warnings (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, admin_id INTEGER, text TEXT, ts INTEGER)`,
   `CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, kind TEXT, text TEXT, ts INTEGER, status TEXT DEFAULT 'new')`,
   `CREATE TABLE IF NOT EXISTS games (
     id INTEGER PRIMARY KEY AUTOINCREMENT, p1 INTEGER, p2 INTEGER, board TEXT, xid INTEGER, turn INTEGER, status TEXT,
@@ -968,7 +969,7 @@ async function finishUaReport(env, reporterId, d, shot) {
     ].join("\n"), {
       parse_mode: "HTML",
       reply_markup: { inline_keyboard: [
-        [{ text: "Ban user", callback_data: `adm_ban_${d.target}` }, { text: "Dismiss", callback_data: `adm_dis_${d.target}` }],
+        [{ text: "Ban user", callback_data: `adm_ban_${d.target}` }, { text: "⚠️ Warn", callback_data: `adm_warn_${d.target}` }, { text: "Dismiss", callback_data: `adm_dis_${d.target}` }],
         [{ text: "View user", callback_data: `adm_u_${d.target}` }],
       ] },
     });
@@ -1053,6 +1054,29 @@ async function handleFeedbackReply(env, msg, st) {
   await notify(env, fb.user_id, `📩 Reply from the Nexus team:\n\n${text}`); // chat me ho to chat ke baad milega
   await env.DB.prepare("UPDATE feedback SET status = 'replied' WHERE id = ?").bind(id).run();
   return send(env, msg.chat.id, `✅ Reply sent for feedback #${id}.`);
+}
+
+// ---------------------------------------------------------------- Official warning (opening + closing fixed, beech ka message admin likhta hai)
+
+const WARN_OPEN = "⚠️ Official Notice from the Nexus Team\n\nDear user,\n\nThis is an official notice regarding your account on Nexus Anonymous Chat.\n\n";
+const WARN_CLOSE = "\n\nPlease follow the community rules so that Nexus stays safe and respectful for everyone. Repeated violations may lead to a temporary or permanent ban.\n\nIf you believe this notice was sent by mistake, you can write to us using /feedback.\n\nRegards,\nNexus Team";
+const buildWarning = (middle) => WARN_OPEN + middle + WARN_CLOSE;
+
+// text na ho to admin se beech ka message maangta hai, ho to seedha preview dikhata hai
+async function startWarn(env, adminId, chatId, uid, middle) {
+  if (!(await getProfile(env, uid))) return send(env, chatId, "User not found.");
+  if (isAdmin(env, uid)) return send(env, chatId, "You cannot warn an admin.");
+  if (!middle) {
+    await setState(env, adminId, "warn", String(uid));
+    return send(env, chatId, `Write the middle part of the warning for user ${uid} (one message, 10-800 characters).\nThe opening and closing lines are added automatically. /cancel to stop.`);
+  }
+  middle = middle.trim();
+  if (middle.length < 10 || middle.length > 800) return send(env, chatId, `The message must be 10-800 characters (yours: ${middle.length}). Try again.`);
+  await setState(env, adminId, "warnp", JSON.stringify({ uid, middle }));
+  return send(env, chatId, `<b>Preview for user <code>${uid}</code></b>\n\n${esc(buildWarning(middle))}`, {
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [[{ text: "✅ Send", callback_data: "adm_wsend" }, { text: "Cancel", callback_data: "adm_wcancel" }]] },
+  });
 }
 
 async function viewFeedback(env) {
@@ -1210,9 +1234,10 @@ async function viewUserCard(env, id) {
     `Reports against: ${reps.c} (from ${reps.d} users)`,
     `Saved partners: ${saved}`,
     `Bans so far: ${u.ban_count || 0}`,
+    `Warnings sent: ${await count(env, "SELECT COUNT(*) FROM warnings WHERE user_id = ?", id)}`,
   ].join("\n");
   const action = u.banned ? { text: "Unban user", callback_data: `adm_unban_${id}` } : { text: "Ban user", callback_data: `adm_ban_${id}` };
-  return { text, kb: adminKb([[action], [{ text: "Refresh", callback_data: `adm_u_${id}` }, { text: "Back", callback_data: "adm_users" }]]) };
+  return { text, kb: adminKb([[action, { text: "⚠️ Warn", callback_data: `adm_warn_${id}` }], [{ text: "Refresh", callback_data: `adm_u_${id}` }, { text: "Back", callback_data: "adm_users" }]]) };
 }
 
 async function viewReports(env) {
@@ -1559,6 +1584,12 @@ async function onCommand(env, msg) {
     return send(env, chatId, `User ${id} has been banned (${res.label}).`);
   }
 
+  if (cmd === "warn") {
+    const wm = arg.match(/^(\d+)\s*([\s\S]*)$/);
+    if (!wm) return send(env, chatId, "Usage: /warn <id> <your message>\nExample: /warn 123456 We received a report about vulgar language in your chats.");
+    return startWarn(env, user.id, chatId, Number(wm[1]), wm[2]);
+  }
+
   if (cmd === "unban") {
     const id = Number(arg);
     if (!id) return send(env, chatId, "Usage: /unban <id>");
@@ -1615,6 +1646,10 @@ async function onMessage(env, msg) {
   if (st && st.kind === "fbk") {
     if (!text || BUTTONS.includes(text)) await clearState(env, userId);
     else return handleFeedbackText(env, msg, st);
+  }
+  if (st && st.kind === "warn" && isAdmin(env, userId)) {
+    if (!text || BUTTONS.includes(text)) await clearState(env, userId);
+    else return startWarn(env, userId, chatId, Number(st.data), text);
   }
   if (st && st.kind === "fbr" && isAdmin(env, userId)) {
     if (!text || BUTTONS.includes(text)) await clearState(env, userId);
@@ -1716,6 +1751,21 @@ async function onCallback(env, cq) {
     if (data === "adm_bc") return editView(env, chatId, mid, await viewBroadcast(env));
     if (data === "adm_set") return editView(env, chatId, mid, await viewSettings(env));
     if (data === "adm_fb") return editView(env, chatId, mid, await viewFeedback(env));
+    if (data.startsWith("adm_warn_")) return startWarn(env, userId, chatId, id);
+    if (data === "adm_wcancel") {
+      await clearState(env, userId);
+      return edit("Warning cancelled. Nothing was sent.");
+    }
+    if (data === "adm_wsend") {
+      const st = await getState(env, userId);
+      let d = null;
+      try { d = JSON.parse((st && st.data) || "null"); } catch (e) {}
+      if (!st || st.kind !== "warnp" || !d) return edit("This preview has expired. Use /warn again.");
+      await clearState(env, userId);
+      await notify(env, d.uid, buildWarning(d.middle)); // user chat me ho to chat ke baad milega
+      await env.DB.prepare("INSERT INTO warnings (user_id, admin_id, text, ts) VALUES (?, ?, ?, ?)").bind(d.uid, userId, d.middle, nowSec()).run();
+      return edit(`✅ Warning sent to user ${d.uid}.`);
+    }
     if (data.startsWith("adm_fr_")) {
       const fb = await env.DB.prepare("SELECT id FROM feedback WHERE id = ?").bind(id).first();
       if (!fb) return send(env, chatId, "Feedback not found.");
