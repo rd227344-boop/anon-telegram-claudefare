@@ -17,7 +17,7 @@ const DEFAULTS = {
   MIN_REPORT_TEXT: 25, // underage report / appeal mein kam se kam itne characters
 };
 const MAX_SAVED = 10; // ek user ke max saved partners
-const CODE_VERSION = "v7-warn-notice"; // worker URL kholne par dikhta hai, isse pata chalta hai nayi file live hui ya nahi
+const CODE_VERSION = "v7b-profile-id"; // worker URL kholne par dikhta hai, isse pata chalta hai nayi file live hui ya nahi
 const cfg = (env, key) => {
   const v = Number(env[key]);
   return Number.isFinite(v) && v > 0 ? v : DEFAULTS[key];
@@ -1529,7 +1529,8 @@ async function onCommand(env, msg) {
       `Gender: ${p.gender}   Age: ${p.age}`,
       `Language: ${p.language}`,
       `Saved partners: ${await savedCount(env, user.id)}/${MAX_SAVED}`,
-    ].join("\n"), { reply_markup: MAIN_KEYBOARD });
+      `Your ID: <code>${user.id}</code> (tap to copy)`,
+    ].join("\n"), { reply_markup: MAIN_KEYBOARD, parse_mode: "HTML" });
   }
   if (cmd === "cancel") {
     await clearState(env, user.id);
