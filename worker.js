@@ -17,7 +17,7 @@ const DEFAULTS = {
   MIN_REPORT_TEXT: 25, // underage report / appeal mein kam se kam itne characters
 };
 const MAX_SAVED = 10; // ek user ke max saved partners
-const CODE_VERSION = "v7b-profile-id"; // worker URL kholne par dikhta hai, isse pata chalta hai nayi file live hui ya nahi
+const CODE_VERSION = "v8b-faster-hideable-menu"; // worker URL kholne par dikhta hai, isse pata chalta hai nayi file live hui ya nahi
 const cfg = (env, key) => {
   const v = Number(env[key]);
   return Number.isFinite(v) && v > 0 ? v : DEFAULTS[key];
@@ -48,14 +48,15 @@ const BTN_HIDE = "🔽 Hide Menu";
 const BTN_SEARCH = "🔍 Find Partner";
 const BTN_PROFILE = "👤 My Profile";
 const BTN_FEEDBACK = "💬 Feedback";
-const BUTTONS = [BTN_NEXT, BTN_STOP, BTN_SAVE, BTN_SAVED, BTN_PLAY, BTN_HIDE, BTN_SEARCH, BTN_PROFILE, BTN_FEEDBACK];
+const BTN_ID = "🆔 My ID";
+const BUTTONS = [BTN_NEXT, BTN_STOP, BTN_SAVE, BTN_SAVED, BTN_PLAY, BTN_HIDE, BTN_SEARCH, BTN_PROFILE, BTN_FEEDBACK, BTN_ID];
 // purane keyboard wale users abhi purane labels bhejenge, unhe naye button maano
 const LEGACY_BTN = { "Next Partner": BTN_NEXT, "Stop Chat": BTN_STOP, "Save Partner": BTN_SAVE, "Saved Partners": BTN_SAVED };
 
 // Teen keyboard: chat ke andar sirf kaam ke buttons, search me sirf Stop, chat ke bahar poora menu
-const CHAT_KEYBOARD = { keyboard: [[{ text: BTN_NEXT }, { text: BTN_STOP }], [{ text: BTN_SAVE }, { text: BTN_PLAY }]], resize_keyboard: true, is_persistent: true };
-const SEARCH_KEYBOARD = { keyboard: [[{ text: BTN_STOP }]], resize_keyboard: true, is_persistent: true };
-const IDLE_KEYBOARD = { keyboard: [[{ text: BTN_SEARCH }, { text: BTN_SAVED }], [{ text: BTN_PROFILE }, { text: BTN_FEEDBACK }], [{ text: BTN_HIDE }]], resize_keyboard: true };
+const CHAT_KEYBOARD = { keyboard: [[{ text: BTN_NEXT }, { text: BTN_STOP }], [{ text: BTN_SAVE }, { text: BTN_PLAY }]], resize_keyboard: true };
+const SEARCH_KEYBOARD = { keyboard: [[{ text: BTN_STOP }]], resize_keyboard: true };
+const IDLE_KEYBOARD = { keyboard: [[{ text: BTN_SEARCH }, { text: BTN_SAVED }], [{ text: BTN_PROFILE }, { text: BTN_FEEDBACK }], [{ text: BTN_ID }, { text: BTN_HIDE }]], resize_keyboard: true };
 // Code me jahan MAIN_KEYBOARD likha hai, send() user ki halat dekhkar sahi keyboard khud chun leta hai
 const MAIN_KEYBOARD = { keyboard: IDLE_KEYBOARD.keyboard, resize_keyboard: true };
 
@@ -136,6 +137,14 @@ const SCHEMA = [
 let schemaReady = false;
 async function ensureSchema(env) {
   if (schemaReady) return;
+  // Is version ka schema pehle ban chuka hai to dobara kuch mat chalao (cold start tez rahe)
+  try {
+    const sv = await env.DB.prepare("SELECT value FROM settings WHERE key = 'schema_version'").first();
+    if (sv && sv.value === CODE_VERSION) {
+      schemaReady = true;
+      return;
+    }
+  } catch (e) {} // table pehli baar nahi hoti
   await env.DB.batch(SCHEMA.map((s) => env.DB.prepare(s)));
   // purane version ke database ko naye columns de do
   const addMissing = async (table, defs) => {
@@ -153,6 +162,7 @@ async function ensureSchema(env) {
   await addMissing("reports", { details: "TEXT", shot: "TEXT" });
   await addMissing("recent", { gap: "INTEGER DEFAULT 15" });
   await env.DB.batch([env.DB.prepare("DROP TABLE IF EXISTS consent"), env.DB.prepare("DROP TABLE IF EXISTS pending_media")]);
+  await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('schema_version', ?)").bind(CODE_VERSION).run();
   schemaReady = true;
 }
 
@@ -229,10 +239,12 @@ async function send(env, chatId, text, extra = {}) {
 
 // User ki halat ke hisaab se keyboard: chat me / search me / khaali. Menu hide kiya ho to null.
 async function pickKeyboard(env, uid, ignoreHidden) {
-  const u = await env.DB.prepare("SELECT menu_hidden FROM users WHERE user_id = ?").bind(uid).first();
-  if (!ignoreHidden && u && u.menu_hidden) return null;
-  if (await env.DB.prepare("SELECT 1 AS x FROM chats WHERE user_id = ?").bind(uid).first()) return CHAT_KEYBOARD;
-  if (await env.DB.prepare("SELECT 1 AS x FROM queue WHERE user_id = ?").bind(uid).first()) return SEARCH_KEYBOARD;
+  const r = await env.DB.prepare(
+    "SELECT (SELECT menu_hidden FROM users WHERE user_id = ?1) AS h, EXISTS(SELECT 1 FROM chats WHERE user_id = ?1) AS c, EXISTS(SELECT 1 FROM queue WHERE user_id = ?1) AS q"
+  ).bind(uid).first();
+  if (!ignoreHidden && r && r.h) return null;
+  if (r && r.c) return CHAT_KEYBOARD;
+  if (r && r.q) return SEARCH_KEYBOARD;
   return IDLE_KEYBOARD;
 }
 
@@ -761,8 +773,10 @@ async function announceMatch(env, a, b, title) {
   };
   const chatKb = (pid) => ({ inline_keyboard: [[{ text: "⏭ Next", callback_data: `act_next_${pid}` }, { text: "⛔ Stop", callback_data: `act_stop_${pid}` }]] });
   const kbFor = (me, pid) => (me && me.menu_hidden ? chatKb(pid) : MAIN_KEYBOARD); // menu hide hai to inline Next/Stop
-  await send(env, a, msgFor(pa, pb), { reply_markup: kbFor(pa, b), parse_mode: "Markdown" });
-  await send(env, b, msgFor(pb, pa), { reply_markup: kbFor(pb, a), parse_mode: "Markdown" });
+  await Promise.all([
+    send(env, a, msgFor(pa, pb), { reply_markup: kbFor(pa, b), parse_mode: "Markdown" }),
+    send(env, b, msgFor(pb, pa), { reply_markup: kbFor(pb, a), parse_mode: "Markdown" }),
+  ]);
 }
 
 // Cron: queue mein atke hue log (gap khatam hone ke baad) ko jod deta hai
@@ -799,12 +813,16 @@ async function searchPartner(env, userId, chatId) {
 
   await reply("🔍 **Searching for a partner...** Please wait.", { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD });
 
-  // 1-2 second same language ka intezaar, phir kisi se bhi
-  await sleep(env, 1500);
-  if (await inQueue(env, userId)) {
-    let p2 = await claimPair(env, userId, true);
-    if (!p2 && (await inQueue(env, userId))) p2 = await claimPair(env, userId, false);
-    if (p2) return announceMatch(env, userId, p2);
+  // Same language ka thoda intezaar, phir kisi se bhi. Queue me koi aur nahi hai to intezaar bekaar hai.
+  const others = await count(env, "SELECT COUNT(*) FROM queue WHERE user_id != ?", userId);
+  if (others > 0) {
+    const waitMs = Number(env.LANG_WAIT_MS ?? 800); // env LANG_WAIT_MS se badlo, 0 = bilkul intezaar nahi
+    if (waitMs > 0) await sleep(env, waitMs);
+    if (await inQueue(env, userId)) {
+      let p2 = await claimPair(env, userId, true);
+      if (!p2 && (await inQueue(env, userId))) p2 = await claimPair(env, userId, false);
+      if (p2) return announceMatch(env, userId, p2);
+    }
   }
 
   // Agar abhi gap chal raha hai (pichle partner se), to gap khatam hote hi ek baar aur try karo
@@ -847,26 +865,36 @@ async function stopChat(env, userId, chatId) {
   }
   await endChat(env, userId, partnerId);
 
-  await send(env, chatId, "**You stopped the chat.**\nType /search to find a new partner.", { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
-  await sendFeedback(env, chatId, partnerId, false);
-
-  await send(env, partnerId, "**Your partner stopped the chat.**\nType /search to find a new partner.", { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
-  await sendFeedback(env, partnerId, userId, true);
-  await deliverPending(env, partnerId);
-  await deliverPending(env, userId);
+  await Promise.all([
+    (async () => {
+      await send(env, chatId, "**You stopped the chat.**\nType /search to find a new partner.", { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
+      await sendFeedback(env, chatId, partnerId, false);
+      await deliverPending(env, userId);
+    })(),
+    (async () => {
+      await send(env, partnerId, "**Your partner stopped the chat.**\nType /search to find a new partner.", { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
+      await sendFeedback(env, partnerId, userId, true);
+      await deliverPending(env, partnerId);
+    })(),
+  ]);
 }
 
 async function nextPartner(env, userId, chatId) {
   const partnerId = await getPartner(env, userId);
   if (partnerId) {
     await endChat(env, userId, partnerId);
-    await send(env, chatId, "**You skipped your partner.**\nLooking for a new partner...", { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
-    await sendFeedback(env, chatId, partnerId, false);
-
-    await send(env, partnerId, "**Your partner skipped the chat.**\nType /search to find a new partner.", { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
-    await sendFeedback(env, partnerId, userId, true);
-    await deliverPending(env, partnerId);
-    await deliverPending(env, userId);
+    await Promise.all([
+      (async () => {
+        await send(env, chatId, "**You skipped your partner.**\nLooking for a new partner...", { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
+        await sendFeedback(env, chatId, partnerId, false);
+        await deliverPending(env, userId);
+      })(),
+      (async () => {
+        await send(env, partnerId, "**Your partner skipped the chat.**\nType /search to find a new partner.", { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
+        await sendFeedback(env, partnerId, userId, true);
+        await deliverPending(env, partnerId);
+      })(),
+    ]);
   }
   await env.DB.prepare("DELETE FROM queue WHERE user_id = ?").bind(userId).run();
   return searchPartner(env, userId, chatId);
@@ -1536,7 +1564,7 @@ async function onCommand(env, msg) {
     await clearState(env, user.id);
     return send(env, chatId, "Cancelled.", { reply_markup: MAIN_KEYBOARD });
   }
-  if (cmd === "myid") return send(env, chatId, `Your Telegram ID: <code>${user.id}</code>`, { parse_mode: "HTML" });
+  if (cmd === "myid") return send(env, chatId, `🆔 Your Telegram ID: <code>${user.id}</code>\n(tap the number to copy it)`, { parse_mode: "HTML", reply_markup: MAIN_KEYBOARD });
 
   if (cmd === "help") {
     return send(env, chatId, [
@@ -1667,6 +1695,7 @@ async function onMessage(env, msg) {
   if (text === BTN_SEARCH) return searchPartner(env, userId, chatId);
   if (text === BTN_PROFILE) return onCommand(env, { ...msg, text: "/profile" });
   if (text === BTN_FEEDBACK) return startFeedback(env, userId, chatId);
+  if (text === BTN_ID) return onCommand(env, { ...msg, text: "/myid" });
 
   // Normal chat message
   const partnerId = await getPartner(env, userId);
@@ -2099,9 +2128,18 @@ async function onCallback(env, cq) {
 // ---------------------------------------------------------------- Entry points
 
 async function handleUpdate(env, update) {
-  await ensureSchema(env);
-  if (update.message) return onMessage(env, update.message);
-  if (update.callback_query) return onCallback(env, update.callback_query);
+  const t0 = Date.now();
+  try {
+    await ensureSchema(env);
+    if (update.message) return await onMessage(env, update.message);
+    if (update.callback_query) return await onCallback(env, update.callback_query);
+  } finally {
+    const ms = Date.now() - t0;
+    if (ms > 1500) {
+      const what = update.callback_query ? "cb:" + String(update.callback_query.data || "").slice(0, 20) : "msg:" + String((update.message && update.message.text) || "(media)").slice(0, 20);
+      console.log("slow update", ms + "ms", what);
+    }
+  }
 }
 
 async function runCron(env) {
