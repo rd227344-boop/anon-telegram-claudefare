@@ -17,7 +17,7 @@ const DEFAULTS = {
   MIN_REPORT_TEXT: 25, // underage report / appeal mein kam se kam itne characters
 };
 const MAX_SAVED = 10; // ek user ke max saved partners
-const CODE_VERSION = "v8b-faster-hideable-menu"; // worker URL kholne par dikhta hai, isse pata chalta hai nayi file live hui ya nahi
+const CODE_VERSION = "v9-invites"; // worker URL kholne par dikhta hai, isse pata chalta hai nayi file live hui ya nahi
 const cfg = (env, key) => {
   const v = Number(env[key]);
   return Number.isFinite(v) && v > 0 ? v : DEFAULTS[key];
@@ -49,14 +49,15 @@ const BTN_SEARCH = "🔍 Find Partner";
 const BTN_PROFILE = "👤 My Profile";
 const BTN_FEEDBACK = "💬 Feedback";
 const BTN_ID = "🆔 My ID";
-const BUTTONS = [BTN_NEXT, BTN_STOP, BTN_SAVE, BTN_SAVED, BTN_PLAY, BTN_HIDE, BTN_SEARCH, BTN_PROFILE, BTN_FEEDBACK, BTN_ID];
+const BTN_INVITE = "🤝 Invite Friends";
+const BUTTONS = [BTN_NEXT, BTN_STOP, BTN_SAVE, BTN_SAVED, BTN_PLAY, BTN_HIDE, BTN_SEARCH, BTN_PROFILE, BTN_FEEDBACK, BTN_ID, BTN_INVITE];
 // purane keyboard wale users abhi purane labels bhejenge, unhe naye button maano
 const LEGACY_BTN = { "Next Partner": BTN_NEXT, "Stop Chat": BTN_STOP, "Save Partner": BTN_SAVE, "Saved Partners": BTN_SAVED };
 
 // Teen keyboard: chat ke andar sirf kaam ke buttons, search me sirf Stop, chat ke bahar poora menu
 const CHAT_KEYBOARD = { keyboard: [[{ text: BTN_NEXT }, { text: BTN_STOP }], [{ text: BTN_SAVE }, { text: BTN_PLAY }]], resize_keyboard: true };
 const SEARCH_KEYBOARD = { keyboard: [[{ text: BTN_STOP }]], resize_keyboard: true };
-const IDLE_KEYBOARD = { keyboard: [[{ text: BTN_SEARCH }, { text: BTN_SAVED }], [{ text: BTN_PROFILE }, { text: BTN_FEEDBACK }], [{ text: BTN_ID }, { text: BTN_HIDE }]], resize_keyboard: true };
+const IDLE_KEYBOARD = { keyboard: [[{ text: BTN_SEARCH }, { text: BTN_SAVED }], [{ text: BTN_PROFILE }, { text: BTN_FEEDBACK }], [{ text: BTN_INVITE }, { text: BTN_ID }], [{ text: BTN_HIDE }]], resize_keyboard: true };
 // Code me jahan MAIN_KEYBOARD likha hai, send() user ki halat dekhkar sahi keyboard khud chun leta hai
 const MAIN_KEYBOARD = { keyboard: IDLE_KEYBOARD.keyboard, resize_keyboard: true };
 
@@ -120,6 +121,8 @@ const SCHEMA = [
   `CREATE INDEX IF NOT EXISTS idx_sr_to ON saved_requests (to_id, status)`,
   `CREATE TABLE IF NOT EXISTS notices (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, text TEXT, ts INTEGER)`,
   `CREATE TABLE IF NOT EXISTS warnings (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, admin_id INTEGER, text TEXT, ts INTEGER)`,
+  `CREATE TABLE IF NOT EXISTS referrals (invitee_id INTEGER PRIMARY KEY, inviter_id INTEGER, ts INTEGER, status TEXT)`,
+  `CREATE INDEX IF NOT EXISTS idx_ref_inviter ON referrals (inviter_id, status)`,
   `CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, kind TEXT, text TEXT, ts INTEGER, status TEXT DEFAULT 'new')`,
   `CREATE TABLE IF NOT EXISTS games (
     id INTEGER PRIMARY KEY AUTOINCREMENT, p1 INTEGER, p2 INTEGER, board TEXT, xid INTEGER, turn INTEGER, status TEXT,
@@ -157,7 +160,7 @@ async function ensureSchema(env) {
     created_at: "INTEGER", last_seen: "INTEGER", banned: "INTEGER DEFAULT 0", ban_reason: "TEXT",
     ban_until: "INTEGER", ban_count: "INTEGER DEFAULT 0", appeal_state: "INTEGER DEFAULT 0", report_floor: "INTEGER DEFAULT 0",
     likes: "INTEGER DEFAULT 0", dislikes: "INTEGER DEFAULT 0", badge_penalty: "INTEGER DEFAULT 0", streak: "INTEGER DEFAULT 0",
-    last_active_day: "TEXT", restrict_until: "INTEGER DEFAULT 0", spam_chats: "INTEGER DEFAULT 0", spam_offenses: "INTEGER DEFAULT 0", menu_hidden: "INTEGER DEFAULT 0",
+    invite_code: "TEXT", ambassador: "INTEGER DEFAULT 0", chat_count: "INTEGER DEFAULT 0", last_active_day: "TEXT", restrict_until: "INTEGER DEFAULT 0", spam_chats: "INTEGER DEFAULT 0", spam_offenses: "INTEGER DEFAULT 0", menu_hidden: "INTEGER DEFAULT 0",
   });
   await addMissing("reports", { details: "TEXT", shot: "TEXT" });
   await addMissing("recent", { gap: "INTEGER DEFAULT 15" });
@@ -278,7 +281,7 @@ async function sendMedia(env, chatId, kind, fileId) {
 
 async function getProfile(env, id) {
   return await env.DB.prepare(
-    "SELECT gender, age, language, waiting_nick, banned, ban_reason, ban_until, ban_count, appeal_state, report_floor, last_seen, likes, dislikes, badge_penalty, streak, last_active_day, restrict_until, spam_chats, spam_offenses, menu_hidden FROM users WHERE user_id = ?"
+    "SELECT gender, age, language, waiting_nick, banned, ban_reason, ban_until, ban_count, appeal_state, report_floor, last_seen, likes, dislikes, badge_penalty, streak, last_active_day, restrict_until, spam_chats, spam_offenses, menu_hidden, ambassador FROM users WHERE user_id = ?"
   ).bind(id).first();
 }
 
@@ -372,7 +375,7 @@ function badgeLevel(u) {
   const lvl = likes >= 20 ? 2 : likes >= 5 ? 1 : 0;
   return Math.max(0, lvl - ((u && u.badge_penalty) || 0));
 }
-const badgeText = (u) => BADGES[badgeLevel(u)] + (u && u.streak >= 7 ? " 🔥 Streak" : "");
+const badgeText = (u) => BADGES[badgeLevel(u)] + (u && u.streak >= 7 ? " 🔥 Streak" : "") + (u && u.ambassador ? " 🤝 Ambassador" : "");
 
 // User kisi aur chat mein hai to message rok lo, chat khatam hone par milega
 async function notify(env, userId, text, exceptPartner) {
@@ -759,6 +762,7 @@ async function claimPair(env, userId, strict = false) {
     env.DB.prepare("INSERT OR REPLACE INTO chats (user_id, partner_id) VALUES (?, ?)").bind(b, a),
     env.DB.prepare("DELETE FROM recent WHERE user_id IN (?, ?)").bind(a, b),
     env.DB.prepare("DELETE FROM link_state WHERE user_id IN (?, ?)").bind(a, b),
+    env.DB.prepare("UPDATE users SET chat_count = COALESCE(chat_count, 0) + 1 WHERE user_id IN (?, ?)").bind(a, b),
     env.DB.prepare("INSERT INTO daily_stats (day, chats) VALUES (?, 1) ON CONFLICT(day) DO UPDATE SET chats = chats + 1").bind(dayKey(now)),
   ]);
   return b;
@@ -777,6 +781,7 @@ async function announceMatch(env, a, b, title) {
     send(env, a, msgFor(pa, pb), { reply_markup: kbFor(pa, b), parse_mode: "Markdown" }),
     send(env, b, msgFor(pb, pa), { reply_markup: kbFor(pb, a), parse_mode: "Markdown" }),
   ]);
+  try { await creditReferrals(env, a, b); } catch (e) { console.log("referral error", String(e)); }
 }
 
 // Cron: queue mein atke hue log (gap khatam hone ke baad) ko jod deta hai
@@ -1031,6 +1036,81 @@ async function handleUaReport(env, msg, st) {
   else if (msg.document && /^image\//.test(msg.document.mime_type || "")) shot = ["document", msg.document.file_id];
   if (!shot) return send(env, chatId, "Please send a photo, or tap Skip.", { reply_markup: SKIP_KB });
   return finishUaReport(env, userId, d, shot);
+}
+
+// ---------------------------------------------------------------- Invites (5 dost = Ambassador tag)
+
+const INVITE_TARGET = 5;
+const INVITES_PER_DAY = 10;
+let botUsernameCache = null;
+
+async function getBotUsername(env) {
+  if (botUsernameCache) return botUsernameCache;
+  const r = await tg(env, "getMe", {});
+  if (r.ok && r.result && r.result.username) botUsernameCache = r.result.username;
+  return botUsernameCache;
+}
+
+async function ensureInviteCode(env, userId) {
+  const u = await env.DB.prepare("SELECT invite_code FROM users WHERE user_id = ?").bind(userId).first();
+  if (u && u.invite_code) return u.invite_code;
+  for (let i = 0; i < 5; i++) {
+    const code = Math.random().toString(36).slice(2, 10);
+    if (code.length < 6) continue;
+    const taken = await env.DB.prepare("SELECT 1 AS x FROM users WHERE invite_code = ?").bind(code).first();
+    if (taken) continue;
+    await env.DB.prepare("UPDATE users SET invite_code = ? WHERE user_id = ?").bind(code, userId).run();
+    return code;
+  }
+  return null;
+}
+
+async function showInvite(env, userId, chatId) {
+  const p = await getProfile(env, userId);
+  if (!isComplete(p)) return send(env, chatId, "Please complete your profile first by typing /start");
+  const code = await ensureInviteCode(env, userId);
+  const uname = await getBotUsername(env);
+  const counted = await count(env, "SELECT COUNT(*) FROM referrals WHERE inviter_id = ? AND status = 'counted'", userId);
+  const waiting = await count(env, "SELECT COUNT(*) FROM referrals WHERE inviter_id = ? AND status = 'pending'", userId);
+  const link = uname && code ? `https://t.me/${uname}?start=r_${code}` : null;
+  const lines = [
+    "🤝 Invite friends to Nexus",
+    "",
+    link ? `Your link:\n${link}` : `Your invite code: r_${code}`,
+    "",
+    p.ambassador ? "You are a 🤝 Ambassador. Thank you for growing Nexus!" : `Progress: ${counted}/${INVITE_TARGET} friends\nInvite ${INVITE_TARGET} friends to earn the 🤝 Ambassador tag.`,
+  ];
+  if (waiting > 0) lines.push(`Joined but not counted yet: ${waiting}`);
+  lines.push("", "A friend counts after they finish their profile and chat at least twice. You only see numbers, never who joined.");
+  const text = encodeURIComponent("Chat anonymously with people around the world on Nexus!");
+  const kb = link ? { inline_keyboard: [[{ text: "📤 Share link", url: `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${text}` }]] } : MAIN_KEYBOARD;
+  return send(env, chatId, lines.join("\n"), { reply_markup: kb });
+}
+
+// /start r_CODE: sirf naye user ke liye, khud ko invite nahi, din me max INVITES_PER_DAY
+async function recordReferral(env, inviteeId, code) {
+  const inv = await env.DB.prepare("SELECT user_id FROM users WHERE invite_code = ?").bind(code).first();
+  if (!inv || inv.user_id === inviteeId) return;
+  const today = await count(env, "SELECT COUNT(*) FROM referrals WHERE inviter_id = ? AND ts > ?", inv.user_id, nowSec() - 86400);
+  if (today >= INVITES_PER_DAY) return;
+  await env.DB.prepare("INSERT OR IGNORE INTO referrals (invitee_id, inviter_id, ts, status) VALUES (?, ?, ?, 'pending')").bind(inviteeId, inv.user_id, nowSec()).run();
+}
+
+// Dost ne profile poori ki aur 2 chats kar li to inviter ki ginti me +1
+async function creditReferrals(env, a, b) {
+  const { results } = await env.DB.prepare(
+    "SELECT r.invitee_id, r.inviter_id FROM referrals r JOIN users u ON u.user_id = r.invitee_id WHERE r.status = 'pending' AND r.invitee_id IN (?, ?) AND COALESCE(u.chat_count, 0) >= 2"
+  ).bind(a, b).all();
+  for (const r of results) {
+    await env.DB.prepare("UPDATE referrals SET status = 'counted' WHERE invitee_id = ?").bind(r.invitee_id).run();
+    const counted = await count(env, "SELECT COUNT(*) FROM referrals WHERE inviter_id = ? AND status = 'counted'", r.inviter_id);
+    if (counted >= INVITE_TARGET) {
+      const got = await env.DB.prepare("UPDATE users SET ambassador = 1 WHERE user_id = ? AND COALESCE(ambassador, 0) = 0 RETURNING user_id").bind(r.inviter_id).first();
+      if (got) await notify(env, r.inviter_id, "🤝 Congratulations! You earned the Ambassador tag for inviting 5 friends. It now shows next to your badge.");
+    } else {
+      await notify(env, r.inviter_id, `🎉 A friend you invited joined Nexus and started chatting! Progress: ${counted}/${INVITE_TARGET}`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------- Feedback
@@ -1505,7 +1585,7 @@ async function gate(env, user, chatId, profile, input = {}) {
 
 // ---------------------------------------------------------------- Commands
 
-const ADMIN_COMMANDS = ["admin", "stats", "user", "ban", "unban", "broadcast"];
+const ADMIN_COMMANDS = ["admin", "stats", "user", "ban", "unban", "broadcast", "warn", "feedbacks", "invites"];
 
 async function onCommand(env, msg) {
   const chatId = msg.chat.id;
@@ -1519,6 +1599,8 @@ async function onCommand(env, msg) {
 
   if (cmd === "start") {
     const profile = await getProfile(env, user.id);
+    const refm = arg.match(/^r_([a-z0-9]{6,12})$/i);
+    if (refm && !isComplete(profile)) await recordReferral(env, user.id, refm[1].toLowerCase());
     if (isComplete(profile)) {
       await setField(env, user, "username", user.username ?? null);
       return send(env, chatId, `**Welcome back to Nexus Anonymous Chat!** 🌍\nYour badge: ${badgeText(profile)}\n\nUse the buttons below:`, { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
@@ -1538,6 +1620,15 @@ async function onCommand(env, msg) {
   if (cmd === "play") return handlePlay(env, user.id, chatId);
   if (cmd === "menu") return showMenu(env, user.id, chatId);
   if (cmd === "feedback") return startFeedback(env, user.id, chatId);
+  if (cmd === "invite") return showInvite(env, user.id, chatId);
+  if (cmd === "invites") {
+    const total = await count(env, "SELECT COUNT(*) FROM referrals");
+    const counted = await count(env, "SELECT COUNT(*) FROM referrals WHERE status = 'counted'");
+    const amb = await count(env, "SELECT COUNT(*) FROM users WHERE ambassador = 1");
+    const { results } = await env.DB.prepare("SELECT inviter_id, SUM(CASE WHEN status = 'counted' THEN 1 ELSE 0 END) AS c, COUNT(*) AS t FROM referrals GROUP BY inviter_id ORDER BY c DESC, t DESC LIMIT 10").all();
+    const lines = results.map((r) => `<code>${r.inviter_id}</code>: ${r.c} counted / ${r.t} joined`);
+    return send(env, chatId, ["<b>Invites</b>", `Joined via invite: ${total}   Counted: ${counted}   Ambassadors: ${amb}`, "", "Top inviters:", ...(lines.length ? lines : ["No invites yet."])].join("\n"), { parse_mode: "HTML" });
+  }
   if (cmd === "feedbacks" && isAdmin(env, user.id)) {
     const v = await viewFeedback(env);
     return send(env, chatId, v.text, { parse_mode: "HTML", reply_markup: v.kb });
@@ -1575,6 +1666,7 @@ async function onCommand(env, msg) {
       "/play - play Tic-Tac-Toe with your partner",
       "/menu - show the bottom menu buttons",
       "/feedback - send feedback to the team",
+      "/invite - invite friends and earn the Ambassador tag",
       "/hidemenu - hide the bottom menu buttons",
       "/profile - see your badge and progress",
       "/stop - end the chat or stop searching",
@@ -1696,6 +1788,7 @@ async function onMessage(env, msg) {
   if (text === BTN_PROFILE) return onCommand(env, { ...msg, text: "/profile" });
   if (text === BTN_FEEDBACK) return startFeedback(env, userId, chatId);
   if (text === BTN_ID) return onCommand(env, { ...msg, text: "/myid" });
+  if (text === BTN_INVITE) return showInvite(env, userId, chatId);
 
   // Normal chat message
   const partnerId = await getPartner(env, userId);
@@ -2072,6 +2165,7 @@ async function onCallback(env, cq) {
       env.DB.prepare("INSERT OR REPLACE INTO chats (user_id, partner_id) VALUES (?, ?)").bind(a, b),
       env.DB.prepare("INSERT OR REPLACE INTO chats (user_id, partner_id) VALUES (?, ?)").bind(b, a),
       env.DB.prepare("DELETE FROM recent WHERE user_id IN (?, ?)").bind(a, b),
+      env.DB.prepare("UPDATE users SET chat_count = COALESCE(chat_count, 0) + 1 WHERE user_id IN (?, ?)").bind(a, b),
       env.DB.prepare("INSERT INTO daily_stats (day, chats) VALUES (?, 1) ON CONFLICT(day) DO UPDATE SET chats = chats + 1").bind(dayKey(nowSec())),
     ]);
     await edit("✅ Accepted.");
@@ -2179,6 +2273,7 @@ export default {
             { command: "play", description: "Play Tic-Tac-Toe" },
             { command: "menu", description: "Show or hide the bottom buttons" },
             { command: "feedback", description: "Send feedback to the team" },
+            { command: "invite", description: "Invite friends, earn Ambassador tag" },
             { command: "profile", description: "Your badge and progress" },
             { command: "report", description: "Report your current partner" },
             { command: "help", description: "Show commands" },
