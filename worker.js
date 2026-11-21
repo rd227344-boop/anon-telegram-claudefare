@@ -17,7 +17,7 @@ const DEFAULTS = {
   MIN_REPORT_TEXT: 25, // underage report / appeal mein kam se kam itne characters
 };
 const MAX_SAVED = 10; // ek user ke max saved partners
-const CODE_VERSION = "v9-invites"; // worker URL kholne par dikhta hai, isse pata chalta hai nayi file live hui ya nahi
+const CODE_VERSION = "v10-fewer-db-calls"; // worker URL kholne par dikhta hai, isse pata chalta hai nayi file live hui ya nahi
 const cfg = (env, key) => {
   const v = Number(env[key]);
   return Number.isFinite(v) && v > 0 ? v : DEFAULTS[key];
@@ -281,9 +281,12 @@ async function sendMedia(env, chatId, kind, fileId) {
 
 async function getProfile(env, id) {
   return await env.DB.prepare(
-    "SELECT gender, age, language, waiting_nick, banned, ban_reason, ban_until, ban_count, appeal_state, report_floor, last_seen, likes, dislikes, badge_penalty, streak, last_active_day, restrict_until, spam_chats, spam_offenses, menu_hidden, ambassador FROM users WHERE user_id = ?"
-  ).bind(id).first();
+    "SELECT gender, age, language, waiting_nick, banned, ban_reason, ban_until, ban_count, appeal_state, report_floor, last_seen, likes, dislikes, badge_penalty, streak, last_active_day, restrict_until, spam_chats, spam_offenses, menu_hidden, ambassador, (SELECT partner_id FROM chats WHERE user_id = ?1) AS chat_partner, EXISTS(SELECT 1 FROM queue WHERE user_id = ?1) AS in_queue, (SELECT id FROM saved_requests WHERE to_id = ?1 AND kind = 'connect' AND status = 'shown' AND ts > ?2 ORDER BY id LIMIT 1) AS pending_req FROM users WHERE user_id = ?1"
+  ).bind(id, nowSec() - 86400).first();
 }
+
+// Profile se hi sahi keyboard (extra DB call nahi). Menu hide hai to undefined.
+const kbOf = (p) => (p && p.menu_hidden ? undefined : p && p.chat_partner ? CHAT_KEYBOARD : p && p.in_queue ? SEARCH_KEYBOARD : IDLE_KEYBOARD);
 
 const isComplete = (p) => !!(p && p.gender && p.age && p.language);
 
@@ -350,8 +353,7 @@ async function setConsent(env, sender, receiver, cat, state) {
 
 // Chat khatam: chat rows hatao, gap lagao, media permissions reset karo
 async function endChat(env, a, b) {
-  await finalizeLinks(env, a);
-  await finalizeLinks(env, b);
+  await Promise.all([finalizeLinks(env, a), finalizeLinks(env, b)]);
   const t = nowSec();
   const min = cfg(env, "GAP_MIN_SECONDS");
   const max = Math.max(min, cfg(env, "GAP_MAX_SECONDS"));
@@ -795,28 +797,32 @@ async function runMatcher(env) {
   }
 }
 
-async function searchPartner(env, userId, chatId) {
+async function searchPartner(env, userId, chatId, pre) {
   const reply = (text, extra) => send(env, chatId, text, extra);
-  const profile = await getProfile(env, userId);
+  const profile = pre || (await getProfile(env, userId));
   if (!isComplete(profile)) {
     return reply("Please complete your profile first by typing /start");
   }
-  if (await blockedByPending(env, userId, chatId)) return;
-  if (await getPartner(env, userId)) {
+  if (profile.pending_req) {
+    return reply("🔗 Please accept or decline this request first.", { reply_markup: reqKb("cn", profile.pending_req) });
+  }
+  if (profile.chat_partner) {
     return reply(`You are already in a chat. Use /stop or ${BTN_NEXT}.`);
   }
-  if (await inQueue(env, userId)) {
+  if (profile.in_queue) {
     return reply("Already searching...");
   }
 
-  await env.DB.prepare("INSERT OR IGNORE INTO queue (user_id, ts) VALUES (?, ?)").bind(userId, nowSec()).run();
-  let partner = await claimPair(env, userId, true); // pehle same language wale ko try
+  // Queue me daalna aur "Searching" message ek saath, taaki user ko jawab jaldi dikhe
+  await Promise.all([
+    env.DB.prepare("INSERT OR IGNORE INTO queue (user_id, ts) VALUES (?, ?)").bind(userId, nowSec()).run(),
+    reply("🔍 **Searching for a partner...** Please wait.", { parse_mode: "Markdown", reply_markup: profile.menu_hidden ? undefined : SEARCH_KEYBOARD }),
+  ]);
+  const partner = await claimPair(env, userId, true); // pehle same language wale ko try
   if (partner) {
     return announceMatch(env, userId, partner);
   }
   if (!(await inQueue(env, userId))) return; // kisi aur ne humein match kar diya, wahi message bhej dega
-
-  await reply("🔍 **Searching for a partner...** Please wait.", { parse_mode: "Markdown", reply_markup: MAIN_KEYBOARD });
 
   // Same language ka thoda intezaar, phir kisi se bhi. Queue me koi aur nahi hai to intezaar bekaar hai.
   const others = await count(env, "SELECT COUNT(*) FROM queue WHERE user_id != ?", userId);
@@ -859,12 +865,16 @@ async function sendFeedback(env, chatId, partnerId, withSearch) {
   return send(env, chatId, FEEDBACK_TEXT, { reply_markup: feedbackKeyboard(partnerId, withSearch) });
 }
 
-async function stopChat(env, userId, chatId) {
-  if (await inQueue(env, userId)) {
-    await env.DB.prepare("DELETE FROM queue WHERE user_id = ?").bind(userId).run();
-    return send(env, chatId, "Search stopped.", { reply_markup: MAIN_KEYBOARD });
+async function stopChat(env, userId, chatId, pre) {
+  const profile = pre || (await getProfile(env, userId)) || {};
+  if (profile.in_queue) {
+    await Promise.all([
+      env.DB.prepare("DELETE FROM queue WHERE user_id = ?").bind(userId).run(),
+      send(env, chatId, "Search stopped.", { reply_markup: profile.menu_hidden ? undefined : IDLE_KEYBOARD }),
+    ]);
+    return;
   }
-  const partnerId = await getPartner(env, userId);
+  const partnerId = profile.chat_partner || null;
   if (!partnerId) {
     return send(env, chatId, "You are not in an active chat.", { reply_markup: MAIN_KEYBOARD });
   }
@@ -884,8 +894,8 @@ async function stopChat(env, userId, chatId) {
   ]);
 }
 
-async function nextPartner(env, userId, chatId) {
-  const partnerId = await getPartner(env, userId);
+async function nextPartner(env, userId, chatId, pre) {
+  const partnerId = ((pre || (await getProfile(env, userId))) || {}).chat_partner || null;
   if (partnerId) {
     await endChat(env, userId, partnerId);
     await Promise.all([
@@ -1585,9 +1595,9 @@ async function gate(env, user, chatId, profile, input = {}) {
 
 // ---------------------------------------------------------------- Commands
 
-const ADMIN_COMMANDS = ["admin", "stats", "user", "ban", "unban", "broadcast", "warn", "feedbacks", "invites"];
+const ADMIN_COMMANDS = ["admin", "stats", "user", "ban", "unban", "broadcast", "warn", "feedbacks", "invites", "health"];
 
-async function onCommand(env, msg) {
+async function onCommand(env, msg, pre) {
   const chatId = msg.chat.id;
   const user = msg.from;
   const m = msg.text.match(/^\/(\w+)(?:@\w+)?(?:\s+([\s\S]*))?$/);
@@ -1614,12 +1624,19 @@ async function onCommand(env, msg) {
     return send(env, chatId, "**Welcome to Nexus Anonymous Chat!** 🌍\n\nMeet people from around the world.\nChat kindly to earn badges: 🌱 → 😊 → ⭐\n\nPlease select your **Gender**:", { reply_markup: keyboard, parse_mode: "Markdown" });
   }
 
-  if (cmd === "search") return searchPartner(env, user.id, chatId);
-  if (cmd === "stop") return stopChat(env, user.id, chatId);
-  if (cmd === "next") return nextPartner(env, user.id, chatId);
+  if (cmd === "search") return searchPartner(env, user.id, chatId, pre);
+  if (cmd === "stop") return stopChat(env, user.id, chatId, pre);
+  if (cmd === "next") return nextPartner(env, user.id, chatId, pre);
   if (cmd === "play") return handlePlay(env, user.id, chatId);
   if (cmd === "menu") return showMenu(env, user.id, chatId);
   if (cmd === "feedback") return startFeedback(env, user.id, chatId);
+  if (cmd === "health") {
+    // Kitna time lag raha hai: database ka ek call aur Telegram ka ek call (milliseconds)
+    const a0 = Date.now(); await env.DB.prepare("SELECT 1 AS x").first(); const d1 = Date.now() - a0;
+    const b0 = Date.now(); await env.DB.prepare("SELECT 1 AS x").first(); const d2 = Date.now() - b0;
+    const c0 = Date.now(); await tg(env, "getMe", {}); const t1 = Date.now() - c0;
+    return send(env, chatId, `Health check\nDatabase call: ${d1} ms (then ${d2} ms)\nTelegram API call: ${t1} ms\nVersion: ${CODE_VERSION}\n\nGood: database under 50 ms. If it is 150 ms or more, turn on Smart Placement in Cloudflare.`);
+  }
   if (cmd === "invite") return showInvite(env, user.id, chatId);
   if (cmd === "invites") {
     const total = await count(env, "SELECT COUNT(*) FROM referrals");
@@ -1635,7 +1652,7 @@ async function onCommand(env, msg) {
   }
   if (cmd === "hidemenu") return hideMenu(env, user.id, chatId);
   if (cmd === "profile") {
-    const p = await getProfile(env, user.id);
+    const p = pre || (await getProfile(env, user.id));
     if (!isComplete(p)) return send(env, chatId, "Please complete your profile first by typing /start");
     const lvl = badgeLevel(p);
     const likes = p.likes || 0;
@@ -1649,13 +1666,13 @@ async function onCommand(env, msg) {
       `Language: ${p.language}`,
       `Saved partners: ${await savedCount(env, user.id)}/${MAX_SAVED}`,
       `Your ID: <code>${user.id}</code> (tap to copy)`,
-    ].join("\n"), { reply_markup: MAIN_KEYBOARD, parse_mode: "HTML" });
+    ].join("\n"), { reply_markup: kbOf(p), parse_mode: "HTML" });
   }
   if (cmd === "cancel") {
     await clearState(env, user.id);
     return send(env, chatId, "Cancelled.", { reply_markup: MAIN_KEYBOARD });
   }
-  if (cmd === "myid") return send(env, chatId, `🆔 Your Telegram ID: <code>${user.id}</code>\n(tap the number to copy it)`, { parse_mode: "HTML", reply_markup: MAIN_KEYBOARD });
+  if (cmd === "myid") return send(env, chatId, `🆔 Your Telegram ID: <code>${user.id}</code>\n(tap the number to copy it)`, { parse_mode: "HTML", reply_markup: pre ? kbOf(pre) : MAIN_KEYBOARD });
 
   if (cmd === "help") {
     return send(env, chatId, [
@@ -1743,13 +1760,13 @@ async function onMessage(env, msg) {
   const userId = msg.from.id;
   const text = LEGACY_BTN[msg.text] ?? msg.text;
 
-  const profile = await getProfile(env, userId);
+  const isCmd = !!(text && text.startsWith("/"));
+  const [profile, st] = await Promise.all([getProfile(env, userId), isCmd ? null : getState(env, userId), getSettings(env)]); // settings bhi saath me (cache garam)
   if (!(await gate(env, msg.from, chatId, profile, { text }))) return;
 
-  if (text && text.startsWith("/")) return onCommand(env, msg);
+  if (isCmd) return onCommand(env, msg, profile);
 
   // Underage report likhne ka intezaar (text zaroori, screenshot optional)
-  const st = await getState(env, userId);
   if (st && st.kind === "ua") {
     if (text && BUTTONS.includes(text)) await clearState(env, userId);
     else return handleUaReport(env, msg, st);
@@ -1777,21 +1794,21 @@ async function onMessage(env, msg) {
     else return handleFeedbackReply(env, msg, st);
   }
 
-  if (text === BTN_NEXT) return nextPartner(env, userId, chatId);
-  if (text === BTN_STOP) return stopChat(env, userId, chatId);
+  if (text === BTN_NEXT) return nextPartner(env, userId, chatId, profile);
+  if (text === BTN_STOP) return stopChat(env, userId, chatId, profile);
 
   if (text === BTN_SAVE) return onSavePressed(env, userId, chatId);
   if (text === BTN_SAVED) return showSaved(env, userId, chatId);
   if (text === BTN_PLAY) return handlePlay(env, userId, chatId);
   if (text === BTN_HIDE) return hideMenu(env, userId, chatId);
-  if (text === BTN_SEARCH) return searchPartner(env, userId, chatId);
-  if (text === BTN_PROFILE) return onCommand(env, { ...msg, text: "/profile" });
+  if (text === BTN_SEARCH) return searchPartner(env, userId, chatId, profile);
+  if (text === BTN_PROFILE) return onCommand(env, { ...msg, text: "/profile" }, profile);
   if (text === BTN_FEEDBACK) return startFeedback(env, userId, chatId);
-  if (text === BTN_ID) return onCommand(env, { ...msg, text: "/myid" });
+  if (text === BTN_ID) return onCommand(env, { ...msg, text: "/myid" }, profile);
   if (text === BTN_INVITE) return showInvite(env, userId, chatId);
 
-  // Normal chat message
-  const partnerId = await getPartner(env, userId);
+  // Normal chat message (partner ka pata profile se hi mil gaya, alag query nahi)
+  const partnerId = profile ? profile.chat_partner : null;
   if (!partnerId) {
     return send(env, chatId, `Type /search or press ${BTN_NEXT} to find someone first.`, { reply_markup: MAIN_KEYBOARD });
   }
