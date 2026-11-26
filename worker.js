@@ -17,7 +17,7 @@ const DEFAULTS = {
   MIN_REPORT_TEXT: 25, // underage report / appeal mein kam se kam itne characters
 };
 const MAX_SAVED = 10; // ek user ke max saved partners
-const CODE_VERSION = "v10-fewer-db-calls"; // worker URL kholne par dikhta hai, isse pata chalta hai nayi file live hui ya nahi
+const CODE_VERSION = "v13b-users-list"; // worker URL kholne par dikhta hai, isse pata chalta hai nayi file live hui ya nahi
 const cfg = (env, key) => {
   const v = Number(env[key]);
   return Number.isFinite(v) && v > 0 ? v : DEFAULTS[key];
@@ -57,7 +57,7 @@ const LEGACY_BTN = { "Next Partner": BTN_NEXT, "Stop Chat": BTN_STOP, "Save Part
 // Teen keyboard: chat ke andar sirf kaam ke buttons, search me sirf Stop, chat ke bahar poora menu
 const CHAT_KEYBOARD = { keyboard: [[{ text: BTN_NEXT }, { text: BTN_STOP }], [{ text: BTN_SAVE }, { text: BTN_PLAY }]], resize_keyboard: true };
 const SEARCH_KEYBOARD = { keyboard: [[{ text: BTN_STOP }]], resize_keyboard: true };
-const IDLE_KEYBOARD = { keyboard: [[{ text: BTN_SEARCH }, { text: BTN_SAVED }], [{ text: BTN_PROFILE }, { text: BTN_FEEDBACK }], [{ text: BTN_INVITE }, { text: BTN_ID }], [{ text: BTN_HIDE }]], resize_keyboard: true };
+const IDLE_KEYBOARD = { keyboard: [[{ text: BTN_SEARCH }, { text: BTN_SAVED }], [{ text: BTN_PROFILE }, { text: BTN_INVITE }], [{ text: BTN_FEEDBACK }]], resize_keyboard: true };
 // Code me jahan MAIN_KEYBOARD likha hai, send() user ki halat dekhkar sahi keyboard khud chun leta hai
 const MAIN_KEYBOARD = { keyboard: IDLE_KEYBOARD.keyboard, resize_keyboard: true };
 
@@ -123,6 +123,7 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS warnings (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, admin_id INTEGER, text TEXT, ts INTEGER)`,
   `CREATE TABLE IF NOT EXISTS referrals (invitee_id INTEGER PRIMARY KEY, inviter_id INTEGER, ts INTEGER, status TEXT)`,
   `CREATE INDEX IF NOT EXISTS idx_ref_inviter ON referrals (inviter_id, status)`,
+  `CREATE TABLE IF NOT EXISTS user_sources (user_id INTEGER PRIMARY KEY, source TEXT, ts INTEGER)`,
   `CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, kind TEXT, text TEXT, ts INTEGER, status TEXT DEFAULT 'new')`,
   `CREATE TABLE IF NOT EXISTS games (
     id INTEGER PRIMARY KEY AUTOINCREMENT, p1 INTEGER, p2 INTEGER, board TEXT, xid INTEGER, turn INTEGER, status TEXT,
@@ -165,6 +166,7 @@ async function ensureSchema(env) {
   await addMissing("reports", { details: "TEXT", shot: "TEXT" });
   await addMissing("recent", { gap: "INTEGER DEFAULT 15" });
   await env.DB.batch([env.DB.prepare("DROP TABLE IF EXISTS consent"), env.DB.prepare("DROP TABLE IF EXISTS pending_media")]);
+  await env.DB.prepare("UPDATE users SET menu_hidden = 0 WHERE menu_hidden = 1").run();
   await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('schema_version', ?)").bind(CODE_VERSION).run();
   schemaReady = true;
 }
@@ -245,7 +247,6 @@ async function pickKeyboard(env, uid, ignoreHidden) {
   const r = await env.DB.prepare(
     "SELECT (SELECT menu_hidden FROM users WHERE user_id = ?1) AS h, EXISTS(SELECT 1 FROM chats WHERE user_id = ?1) AS c, EXISTS(SELECT 1 FROM queue WHERE user_id = ?1) AS q"
   ).bind(uid).first();
-  if (!ignoreHidden && r && r.h) return null;
   if (r && r.c) return CHAT_KEYBOARD;
   if (r && r.q) return SEARCH_KEYBOARD;
   return IDLE_KEYBOARD;
@@ -286,7 +287,7 @@ async function getProfile(env, id) {
 }
 
 // Profile se hi sahi keyboard (extra DB call nahi). Menu hide hai to undefined.
-const kbOf = (p) => (p && p.menu_hidden ? undefined : p && p.chat_partner ? CHAT_KEYBOARD : p && p.in_queue ? SEARCH_KEYBOARD : IDLE_KEYBOARD);
+const kbOf = (p) => (p && p.chat_partner ? CHAT_KEYBOARD : p && p.in_queue ? SEARCH_KEYBOARD : IDLE_KEYBOARD);
 
 const isComplete = (p) => !!(p && p.gender && p.age && p.language);
 
@@ -593,12 +594,11 @@ async function createInvite(env, a, b) {
 }
 
 async function hideMenu(env, userId, chatId) {
-  await env.DB.prepare("UPDATE users SET menu_hidden = 1 WHERE user_id = ?").bind(userId).run();
-  return send(env, chatId, "✅ Menu hidden. Use the Next / Stop buttons on the Connected message, or type /menu to show the menu again.", { reply_markup: { remove_keyboard: true } });
+  // Menu chhupana Telegram ka apna keyboard icon karta hai, bot kuch hide nahi karta
+  return send(env, chatId, "ℹ️ To hide or show the menu, tap the keyboard icon next to the message box. The menu stays there and opens again anytime.");
 }
 async function showMenu(env, userId, chatId) {
-  await env.DB.prepare("UPDATE users SET menu_hidden = 0 WHERE user_id = ?").bind(userId).run();
-  return send(env, chatId, "✅ Menu is back.", { reply_markup: await pickKeyboard(env, userId, true) });
+  return send(env, chatId, "✅ Menu refreshed.", { reply_markup: await pickKeyboard(env, userId, true) });
 }
 
 async function handlePlay(env, userId, chatId) {
@@ -778,7 +778,7 @@ async function announceMatch(env, a, b, title) {
     return `${hello}${head}\nPartner badge: ${badgeText(other)}\nUse the buttons below to control the chat.`;
   };
   const chatKb = (pid) => ({ inline_keyboard: [[{ text: "⏭ Next", callback_data: `act_next_${pid}` }, { text: "⛔ Stop", callback_data: `act_stop_${pid}` }]] });
-  const kbFor = (me, pid) => (me && me.menu_hidden ? chatKb(pid) : MAIN_KEYBOARD); // menu hide hai to inline Next/Stop
+  const kbFor = () => MAIN_KEYBOARD; // chat wala keyboard (Next / Stop / Save / Play)
   await Promise.all([
     send(env, a, msgFor(pa, pb), { reply_markup: kbFor(pa, b), parse_mode: "Markdown" }),
     send(env, b, msgFor(pb, pa), { reply_markup: kbFor(pb, a), parse_mode: "Markdown" }),
@@ -816,7 +816,7 @@ async function searchPartner(env, userId, chatId, pre) {
   // Queue me daalna aur "Searching" message ek saath, taaki user ko jawab jaldi dikhe
   await Promise.all([
     env.DB.prepare("INSERT OR IGNORE INTO queue (user_id, ts) VALUES (?, ?)").bind(userId, nowSec()).run(),
-    reply("🔍 **Searching for a partner...** Please wait.", { parse_mode: "Markdown", reply_markup: profile.menu_hidden ? undefined : SEARCH_KEYBOARD }),
+    reply("🔍 **Searching for a partner...** Please wait.", { parse_mode: "Markdown", reply_markup: SEARCH_KEYBOARD }),
   ]);
   const partner = await claimPair(env, userId, true); // pehle same language wale ko try
   if (partner) {
@@ -870,7 +870,7 @@ async function stopChat(env, userId, chatId, pre) {
   if (profile.in_queue) {
     await Promise.all([
       env.DB.prepare("DELETE FROM queue WHERE user_id = ?").bind(userId).run(),
-      send(env, chatId, "Search stopped.", { reply_markup: profile.menu_hidden ? undefined : IDLE_KEYBOARD }),
+      send(env, chatId, "Search stopped.", { reply_markup: IDLE_KEYBOARD }),
     ]);
     return;
   }
@@ -1197,6 +1197,45 @@ async function startWarn(env, adminId, chatId, uid, middle) {
   });
 }
 
+// ---------------------------------------------------------------- Sources (log kahan se aa rahe hain)
+
+// Admin ke liye: user kahan se aaya. Dost ke invite se aaya ho to kis dost ke link se, aur wo dost khud kahan se aaya tha.
+async function describeSource(env, id) {
+  const r = await env.DB.prepare("SELECT source FROM user_sources WHERE user_id = ?").bind(id).first();
+  if (!r) return "unknown (joined before tracking)";
+  if (r.source !== "invite") return r.source;
+  const ref = await env.DB.prepare("SELECT inviter_id FROM referrals WHERE invitee_id = ?").bind(id).first();
+  if (!ref) return "invite (inviter not recorded)";
+  const up = await env.DB.prepare("SELECT source FROM user_sources WHERE user_id = ?").bind(ref.inviter_id).first();
+  return `invite, invited by ${ref.inviter_id}` + (up ? ` (who came from ${up.source})` : "");
+}
+
+async function viewSources(env, days) {
+  const since = days > 0 ? nowSec() - days * 86400 : 0;
+  const { results } = await env.DB.prepare(
+    `SELECT s.source AS source, COUNT(*) AS joined,
+       SUM(CASE WHEN u.gender IS NOT NULL AND u.age IS NOT NULL AND u.language IS NOT NULL THEN 1 ELSE 0 END) AS profiled,
+       SUM(CASE WHEN COALESCE(u.chat_count, 0) >= 1 THEN 1 ELSE 0 END) AS chatted,
+       SUM(CASE WHEN u.last_seen IS NOT NULL AND u.created_at IS NOT NULL AND u.last_seen - u.created_at >= 86400 THEN 1 ELSE 0 END) AS came_back
+     FROM user_sources s LEFT JOIN users u ON u.user_id = s.user_id
+     WHERE s.ts > ?1 GROUP BY s.source ORDER BY joined DESC, source LIMIT 15`
+  ).bind(since).all();
+  const tracked = await count(env, "SELECT COUNT(*) FROM user_sources WHERE ts > ?", since);
+  const before = await count(env, "SELECT COUNT(*) FROM users WHERE user_id NOT IN (SELECT user_id FROM user_sources)");
+  const lines = results.map((r) => `<code>${esc(r.source)}</code>: ${r.joined} joined, ${r.profiled || 0} finished profile, ${r.chatted || 0} chatted, ${r.came_back || 0} came back`);
+  const text = [
+    `<b>Sources</b> (${days > 0 ? "last " + days + " days" : "all time"})`,
+    `Tracked users: ${tracked}   Joined before tracking: ${before}`,
+    "",
+    ...(lines.length ? lines : ["No data yet. Share links made with /link name."]),
+    "",
+    "joined = pressed Start, finished profile = chose gender, age and language, chatted = had at least one chat, came back = used the bot again a day or more later.",
+  ].join("\n");
+  const srcRows = results.slice(0, 6).map((r) => [{ text: `${r.source} (${r.joined})`.slice(0, 40), callback_data: `adm_up_0_${r.source}`.slice(0, 64) }]);
+  if (before > 0) srcRows.push([{ text: `before tracking (${before})`, callback_data: "adm_up_0_old" }]);
+  return { text, kb: adminKb([[{ text: "Last 7 days", callback_data: "adm_src7" }, { text: "All time", callback_data: "adm_src" }], ...srcRows, [{ text: "All users list", callback_data: "adm_up_0_" }], backRow]) };
+}
+
 async function viewFeedback(env) {
   const total = await count(env, "SELECT COUNT(*) FROM feedback");
   const fresh = await count(env, "SELECT COUNT(*) FROM feedback WHERE status = 'new'");
@@ -1241,7 +1280,8 @@ async function viewHome(env) {
       [{ text: "Dashboard", callback_data: "adm_dash" }, { text: "Users", callback_data: "adm_users" }],
       [{ text: "Reports", callback_data: "adm_reports" }, { text: "Broadcast", callback_data: "adm_bc" }],
       [{ text: "Feedback", callback_data: "adm_fb" }, { text: "Settings", callback_data: "adm_set" }],
-      [{ text: "Refresh", callback_data: "adm_home" }, { text: "Close", callback_data: "adm_close" }],
+      [{ text: "Sources", callback_data: "adm_src" }, { text: "Refresh", callback_data: "adm_home" }],
+      [{ text: "Close", callback_data: "adm_close" }],
     ]),
   };
 }
@@ -1299,24 +1339,48 @@ async function viewDashboard(env) {
   return { text, kb: adminKb([[{ text: "Refresh", callback_data: "adm_dash" }, ...backRow]]) };
 }
 
-async function viewUsers(env) {
-  const total = await count(env, "SELECT COUNT(*) FROM users");
+const agoText = (ts) => {
+  if (!ts) return "?";
+  const d = nowSec() - ts;
+  if (d < 3600) return Math.max(1, Math.floor(d / 60)) + "m ago";
+  if (d < 86400) return Math.floor(d / 3600) + "h ago";
+  return Math.floor(d / 86400) + "d ago";
+};
+
+// Kaun kahan se aaya: 10 users ek page par. source = naam (jaise botlist), "old" = tracking se pehle wale, null = sab
+async function viewUsers(env, page = 0, source = null) {
+  const per = 10;
+  const filt = source === "old" ? "s.source IS NULL" : source ? "s.source = ?" : "1 = 1";
+  const args = source && source !== "old" ? [source] : [];
+  const base = `FROM users u LEFT JOIN user_sources s ON s.user_id = u.user_id WHERE ${filt}`;
+  const total = await count(env, `SELECT COUNT(*) ${base}`, ...args);
   const banned = await count(env, "SELECT COUNT(*) FROM users WHERE banned = 1");
-  const { results } = await env.DB.prepare("SELECT user_id, gender, age, created_at FROM users ORDER BY created_at DESC, user_id DESC LIMIT 8").all();
-  const lines = results.map((r) => `  <code>${r.user_id}</code>  ${esc(r.gender || "-")}, ${esc(r.age || "-")}, ${fmt(r.created_at)}`);
+  const pages = Math.max(1, Math.ceil(total / per));
+  page = Math.min(Math.max(0, Math.floor(page) || 0), pages - 1);
+  const { results } = await env.DB.prepare(
+    `SELECT u.user_id, u.username, u.gender, u.age, u.language, u.created_at, COALESCE(u.chat_count, 0) AS chats, s.source AS source ${base} ORDER BY u.created_at DESC, u.user_id DESC LIMIT ${per} OFFSET ${page * per}`
+  ).bind(...args).all();
+  const lines = results.map((r, n) =>
+    `${page * per + n + 1}. <code>${r.user_id}</code>${r.username ? " @" + esc(r.username) : ""}\n    ${esc((r.gender || "-").slice(0, 1))} ${esc(r.age || "-")} · ${esc(r.language || "-")} · <b>${esc(r.source || "before tracking")}</b> · ${r.chats} chats · ${agoText(r.created_at)}`
+  );
+  const label = source === "old" ? "before tracking" : source ? source : "all sources";
   const text = [
-    "<b>Users</b>",
-    `Total: ${total}   Banned: ${banned}`,
+    "<b>Users: who came from where</b>",
+    `Showing: ${esc(label)}   Page ${page + 1}/${pages}   Total: ${total}   Banned: ${banned}`,
     "",
-    "Look up a user: /user &lt;id&gt;",
-    "Ban: /ban &lt;id&gt; [reason]",
-    "Unban: /unban &lt;id&gt;",
+    lines.length ? lines.join("\n") : "  no users here",
     "",
-    "<b>Recent signups</b>",
-    lines.length ? lines.join("\n") : "  no users yet",
+    "Tap an ID to copy it, then /user ID for the full card.",
+    "Filters: /users botlist   /users old   /users 2",
   ].join("\n");
-  const rows = results.map((r) => [{ text: `User ${r.user_id}`, callback_data: `adm_u_${r.user_id}` }]);
-  rows.push([{ text: "Banned users", callback_data: "adm_banned" }]);
+  const src = source || "";
+  const nav = [];
+  if (page > 0) nav.push({ text: "⬅ Prev", callback_data: `adm_up_${page - 1}_${src}` });
+  if (page < pages - 1) nav.push({ text: "Next ➡", callback_data: `adm_up_${page + 1}_${src}` });
+  const rows = [];
+  if (nav.length) rows.push(nav);
+  if (source) rows.push([{ text: "All users", callback_data: "adm_up_0_" }]);
+  rows.push([{ text: "Sources summary", callback_data: "adm_src" }, { text: "Banned users", callback_data: "adm_banned" }]);
   rows.push(backRow);
   return { text, kb: adminKb(rows) };
 }
@@ -1353,6 +1417,7 @@ async function viewUserCard(env, id) {
     `Saved partners: ${saved}`,
     `Bans so far: ${u.ban_count || 0}`,
     `Warnings sent: ${await count(env, "SELECT COUNT(*) FROM warnings WHERE user_id = ?", id)}`,
+    `Came from: ${esc(await describeSource(env, id))}`,
   ].join("\n");
   const action = u.banned ? { text: "Unban user", callback_data: `adm_unban_${id}` } : { text: "Ban user", callback_data: `adm_ban_${id}` };
   return { text, kb: adminKb([[action, { text: "⚠️ Warn", callback_data: `adm_warn_${id}` }], [{ text: "Refresh", callback_data: `adm_u_${id}` }, { text: "Back", callback_data: "adm_users" }]]) };
@@ -1595,7 +1660,7 @@ async function gate(env, user, chatId, profile, input = {}) {
 
 // ---------------------------------------------------------------- Commands
 
-const ADMIN_COMMANDS = ["admin", "stats", "user", "ban", "unban", "broadcast", "warn", "feedbacks", "invites", "health"];
+const ADMIN_COMMANDS = ["admin", "stats", "user", "ban", "unban", "broadcast", "warn", "feedbacks", "invites", "health", "link", "sources", "users"];
 
 async function onCommand(env, msg, pre) {
   const chatId = msg.chat.id;
@@ -1610,10 +1675,18 @@ async function onCommand(env, msg, pre) {
   if (cmd === "start") {
     const profile = await getProfile(env, user.id);
     const refm = arg.match(/^r_([a-z0-9]{6,12})$/i);
-    if (refm && !isComplete(profile)) await recordReferral(env, user.id, refm[1].toLowerCase());
+    const srcm = arg.match(/^src_([a-z0-9_-]{1,40})$/i);
+    if (!isComplete(profile)) {
+      if (refm) await recordReferral(env, user.id, refm[1].toLowerCase());
+      // user kahan se aaya: src_NAAM link se, dost ke invite se ("invite"), ya seedha ("direct")
+      const source = srcm ? srcm[1].toLowerCase() : refm ? "invite" : "direct";
+      await env.DB.prepare("INSERT OR IGNORE INTO user_sources (user_id, source, ts) VALUES (?, ?, ?)").bind(user.id, source, nowSec()).run();
+    }
     if (isComplete(profile)) {
       await setField(env, user, "username", user.username ?? null);
-      return send(env, chatId, `**Welcome back to Nexus Anonymous Chat!** 🌍\nYour badge: ${badgeText(profile)}\n\nUse the buttons below:`, { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
+      await send(env, chatId, `**Welcome back to Nexus Anonymous Chat!** 🌍\nYour badge: ${badgeText(profile)}\n\nUse the buttons below:`, { reply_markup: MAIN_KEYBOARD, parse_mode: "Markdown" });
+      if (refm) return showInvite(env, user.id, chatId); // dost ka link khola to apna alag link dikhao
+      return;
     }
     const keyboard = {
       inline_keyboard: [
@@ -1630,6 +1703,29 @@ async function onCommand(env, msg, pre) {
   if (cmd === "play") return handlePlay(env, user.id, chatId);
   if (cmd === "menu") return showMenu(env, user.id, chatId);
   if (cmd === "feedback") return startFeedback(env, user.id, chatId);
+  if (cmd === "users") {
+    let page = 0;
+    let src = null;
+    for (const t of arg.trim().split(/\s+/).filter(Boolean)) {
+      if (/^\d+$/.test(t)) page = Number(t) - 1;
+      else src = t.toLowerCase();
+    }
+    const v = await viewUsers(env, page, src);
+    return send(env, chatId, v.text, { parse_mode: "HTML", reply_markup: v.kb });
+  }
+  if (cmd === "link") {
+    const tag = arg.trim().toLowerCase().replace(/[^a-z0-9_-]/g, "").slice(0, 40);
+    const uname = await getBotUsername(env);
+    if (tag === "old") return send(env, chatId, 'The name "old" is reserved. Please use another name.');
+    if (!tag) return send(env, chatId, "Make a tracking link for any place you share the bot.\nUsage: /link name\nExample: /link botlist\nThen use /sources to see how many users came from each link.");
+    if (!uname) return send(env, chatId, "Could not read the bot username right now. Try again in a moment.");
+    return send(env, chatId, `Link for "${tag}":\nhttps://t.me/${uname}?start=src_${tag}\n\nUse a different name for each place (a channel, a group, an ad swap). See results with /sources.`);
+  }
+  if (cmd === "sources") {
+    const d = Number(arg.trim());
+    const v = await viewSources(env, d > 0 && d <= 365 ? Math.floor(d) : 0);
+    return send(env, chatId, v.text, { parse_mode: "HTML", reply_markup: v.kb });
+  }
   if (cmd === "health") {
     // Kitna time lag raha hai: database ka ek call aur Telegram ka ek call (milliseconds)
     const a0 = Date.now(); await env.DB.prepare("SELECT 1 AS x").first(); const d1 = Date.now() - a0;
@@ -1660,7 +1756,7 @@ async function onCommand(env, msg, pre) {
     return send(env, chatId, [
       "👤 Your profile",
       `Badge: ${badgeText(p)}`,
-      prog + (p.badge_penalty > 0 ? "\n(Your badge was lowered by reports. Keep getting likes to recover.)" : ""),
+      prog + (p.badge_penalty > 0 && (p.likes || 0) >= 5 ? "\n(Your badge was lowered by reports. Keep getting likes to recover.)" : ""),
       `Likes: ${likes}   Streak: ${p.streak || 0} day(s)`,
       `Gender: ${p.gender}   Age: ${p.age}`,
       `Language: ${p.language}`,
@@ -1681,10 +1777,9 @@ async function onCommand(env, msg, pre) {
       "/search - find a partner",
       "/next - skip to a new partner",
       "/play - play Tic-Tac-Toe with your partner",
-      "/menu - show the bottom menu buttons",
+      "/menu - refresh the menu buttons (hide or show them with the keyboard icon)",
       "/feedback - send feedback to the team",
       "/invite - invite friends and earn the Ambassador tag",
-      "/hidemenu - hide the bottom menu buttons",
       "/profile - see your badge and progress",
       "/stop - end the chat or stop searching",
       "/report - report your current partner and end the chat",
@@ -1891,6 +1986,12 @@ async function onCallback(env, cq) {
     if (data === "adm_bc") return editView(env, chatId, mid, await viewBroadcast(env));
     if (data === "adm_set") return editView(env, chatId, mid, await viewSettings(env));
     if (data === "adm_fb") return editView(env, chatId, mid, await viewFeedback(env));
+    if (data === "adm_src") return editView(env, chatId, mid, await viewSources(env, 0));
+    if (data.startsWith("adm_up_")) {
+      const up = data.split("_");
+      return editView(env, chatId, mid, await viewUsers(env, Number(up[2]) || 0, up.slice(3).join("_") || null));
+    }
+    if (data === "adm_src7") return editView(env, chatId, mid, await viewSources(env, 7));
     if (data.startsWith("adm_warn_")) return startWarn(env, userId, chatId, id);
     if (data === "adm_wcancel") {
       await clearState(env, userId);
@@ -2288,7 +2389,7 @@ export default {
             { command: "next", description: "Skip to a new partner" },
             { command: "stop", description: "End the chat" },
             { command: "play", description: "Play Tic-Tac-Toe" },
-            { command: "menu", description: "Show or hide the bottom buttons" },
+            { command: "menu", description: "Refresh the menu buttons" },
             { command: "feedback", description: "Send feedback to the team" },
             { command: "invite", description: "Invite friends, earn Ambassador tag" },
             { command: "profile", description: "Your badge and progress" },
